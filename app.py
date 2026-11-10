@@ -51,7 +51,7 @@ class StickTunerApp(tk.Tk):
         self.mid_x = tk.IntVar(value=8880)
         self.mid_y = tk.IntVar(value=9400)
         self.deadzone = tk.IntVar(value=200)
-        self.divisor = tk.IntVar(value=180)
+        self.divisor = tk.IntVar(value=500)
         self.invert_y = tk.BooleanVar(value=False)
 
         self._mv_hist = {0: deque(maxlen=40), 1: deque(maxlen=40)}
@@ -115,7 +115,7 @@ class StickTunerApp(tk.Tk):
         self.scale_mid_x = add_scale(cal, 0, "Centro X", self.mid_x, 0, 12000)
         self.scale_mid_y = add_scale(cal, 1, "Centro Y", self.mid_y, 0, 12000)
         self.scale_dz = add_scale(cal, 2, "Deadzone", self.deadzone, 0, 255)
-        self.scale_div = add_scale(cal, 3, "Velocidade (divisor)", self.divisor, 20, 400)
+        self.scale_div = add_scale(cal, 3, "Velocidade (divisor)", self.divisor, 50, 1000)
         ttk.Label(cal, text="(maior = mais lento)").grid(row=4, column=1, sticky=tk.W)
         ttk.Checkbutton(cal, text="Inverter eixo Y", variable=self.invert_y).grid(
             row=5, column=0, columnspan=2, sticky=tk.W, pady=6
