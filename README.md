@@ -1,40 +1,59 @@
 # PSP Stick Tuner
 
-App de desktop para calibrar o joystick ZMK (PSP Stick) em tempo real pela porta serial USB.
+Aplicativo para **calibrar o joystick USB** (firmware ZMK do projeto [zmk-analog-rp2040](https://github.com/GsMoura033/zmk-analog-rp2040)).
 
-## O que faz
+Não precisa instalar Python se você baixar o **executável** na página de Releases.
 
-- Conecta no **COMx** do PSP Stick
-- Mostra **X/Y mV** ao vivo (logs do firmware)
-- Ajusta **centro**, **deadzone**, **velocidade** e **inverter Y**
-- Botão **Capturar centro** usa a média dos mV atuais
-- **Aplicar** manda comandos `stick ...` para o firmware (vale na hora, em RAM)
+## Para quem só quer usar
 
-> Precisa do firmware com shell (`stick` commands). Builds a partir da calibração runtime no repo `zmk-analog-rp2040`.
+1. Flash o firmware do stick (artefato do GitHub Actions em `zmk-analog-rp2040`).
+2. Ligue o joystick na placa (**VCC → 3,3 V**, nunca 5 V direto no ADC).
+3. Conecte a placa no USB.
+4. Baixe `PSP-Stick-Tuner.exe` em [Releases](https://github.com/GsMoura033/psp-stick-tuner/releases).
+5. Abra o app → **Detectar joystick** → ajuste → **Salvar**.
 
-## Rodar no Windows
+### O que cada ajuste faz
+
+| Controle | Função |
+|---|---|
+| **Usar como centro** | Com o stick parado, define o “zero” para não driftar |
+| **Zona morta** | Ignora tremores no meio (maior = mais estável parado) |
+| **Velocidade** | Número **maior** = cursor **mais lento** (mesmo no máximo de inclinação) |
+| **Inverter cima/baixo** | Troca o sentido do eixo Y |
+| **Salvar** | Envia os valores **e grava na memória da placa** |
+
+A inclinação do stick controla a velocidade (é analógico). O app limita o quanto ele anda no máximo.
+
+## Desenvolvedores (rodar do código)
 
 ```powershell
-cd $env:USERPROFILE\Desktop\psp-stick-tuner
+cd psp-stick-tuner
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python app.py
 ```
 
-1. Liga o stick **com o joystick já conectado** (VCC → 3V3)
-2. Escolhe a porta do **PSP Stick** (não a Sofle)
-3. Conectar → Capturar centro → Aplicar
-4. Ajusta velocidade (divisor maior = mais lento) e aplica de novo
+### Gerar o .exe localmente
 
-## Protocolo
+```powershell
+pip install pyinstaller
+pyinstaller --noconfirm --onefile --windowed --name PSP-Stick-Tuner app.py
+```
 
-| Comando | Efeito |
-|---|---|
-| `stick get` | Lê calibração atual |
-| `stick mid <x> <y>` | Centro em mV reportados |
-| `stick deadzone <n>` | Zona morta (0–255) |
-| `stick divisor <n>` | Velocidade (maior = mais lento) |
-| `stick invert_y <0\|1>` | Inverte eixo Y |
+O executável sai em `dist\PSP-Stick-Tuner.exe`.
 
-Respostas começam com `STICK OK` ou `STICK ERR`.
+## Protocolo serial (COM)
+
+Baud 115200. Comandos:
+
+```
+stick get
+stick mid <x> <y>
+stick deadzone <n>
+stick divisor <n>
+stick invert_y <0|1>
+stick save
+```
+
+Respostas: `STICK OK ...` ou `STICK ERR ...`.

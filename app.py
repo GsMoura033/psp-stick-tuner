@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""PSP Stick Tuner — calibração ao vivo do joystick ZMK via USB CDC."""
+"""PSP Stick Tuner — calibração amigável do joystick ZMK via USB."""
 
 from __future__ import annotations
 
 import re
+import sys
 import threading
 import time
 import tkinter as tk
@@ -19,15 +20,45 @@ except ImportError:
 AIN_RE = re.compile(r"AIN(\d+)\s+raw:\s*(-?\d+)\s+mv:\s*(-?\d+)")
 STICK_RE = re.compile(r"STICK\s+(OK|ERR)\b(.*)$")
 BAUD = 115200
+# VID/PID padrão ZMK (OpenMoko)
+ZMK_VID = 0x1D50
+ZMK_PID = 0x615E
 
 
-def list_serial_ports():
+def list_candidate_ports():
+    """Lista portas; marca as que parecem ZMK/PSP Stick."""
     ports = []
     for p in list_ports.comports():
-        label = f"{p.device} — {p.description}"
-        if p.serial_number:
-            label += f" [{p.serial_number}]"
-        ports.append((p.device, label, (p.description or "") + " " + (p.manufacturer or "")))
+        meta = " ".join(
+            filter(
+                None,
+                [
+                    p.description or "",
+                    p.manufacturer or "",
+                    p.product or "",
+                    p.hwid or "",
+                ],
+            )
+        )
+        is_zmk = (p.vid == ZMK_VID and p.pid == ZMK_PID) or "1D50" in (p.hwid or "").upper()
+        is_psp = "PSP" in meta.upper() or "STICK" in meta.upper()
+        if is_psp:
+            tag = "★ Joystick PSP Stick"
+        elif is_zmk:
+            tag = "• Dispositivo ZMK"
+        else:
+            tag = "Outra porta"
+        label = f"{p.device}  {tag}  ({p.description or 'serial'})"
+        ports.append(
+            {
+                "device": p.device,
+                "label": label,
+                "is_zmk": is_zmk,
+                "is_psp": is_psp,
+                "score": (2 if is_psp else 0) + (1 if is_zmk else 0),
+            }
+        )
+    ports.sort(key=lambda x: (-x["score"], x["device"]))
     return ports
 
 
@@ -35,8 +66,8 @@ class StickTunerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PSP Stick Tuner")
-        self.geometry("520x560")
-        self.minsize(480, 520)
+        self.geometry("580x700")
+        self.minsize(520, 640)
 
         self.ser: serial.Serial | None = None
         self.reader_stop = threading.Event()
@@ -45,7 +76,7 @@ class StickTunerApp(tk.Tk):
 
         self.live_x = tk.StringVar(value="—")
         self.live_y = tk.StringVar(value="—")
-        self.status = tk.StringVar(value="Desconectado")
+        self.status = tk.StringVar(value="Desconectado — ligue o stick no USB")
         self.port_var = tk.StringVar()
 
         self.mid_x = tk.IntVar(value=8880)
@@ -56,50 +87,80 @@ class StickTunerApp(tk.Tk):
 
         self._mv_hist = {0: deque(maxlen=40), 1: deque(maxlen=40)}
         self._last_reply = ""
+        self._port_map: dict[str, str] = {}
 
         self._build_ui()
-        self.refresh_ports()
+        self.refresh_ports(select_best=True)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_ui(self):
-        pad = {"padx": 10, "pady": 6}
-        root = ttk.Frame(self, padding=12)
+        pad = {"padx": 12, "pady": 6}
+        root = ttk.Frame(self, padding=14)
         root.pack(fill=tk.BOTH, expand=True)
 
-        conn = ttk.LabelFrame(root, text="Conexão", padding=10)
-        conn.pack(fill=tk.X, **pad)
-        row = ttk.Frame(conn)
-        row.pack(fill=tk.X)
-        self.port_combo = ttk.Combobox(row, textvariable=self.port_var, state="readonly", width=48)
+        title = ttk.Label(root, text="PSP Stick Tuner", font=("Segoe UI", 16, "bold"))
+        title.pack(anchor=tk.W)
+        ttk.Label(
+            root,
+            text="Calibre o joystick USB. Quanto mais o stick inclina, mais o cursor anda — "
+            "aqui você define o centro, a zona morta e a velocidade máxima.",
+            wraplength=540,
+        ).pack(anchor=tk.W, pady=(2, 10))
+
+        # Passo 1
+        step1 = ttk.LabelFrame(root, text="Passo 1 — Conectar o joystick", padding=10)
+        step1.pack(fill=tk.X, **pad)
+        ttk.Label(
+            step1,
+            text="1) Ligue o joystick na placa (VCC no 3,3 V, não no 5 V)\n"
+            "2) Conecte a placa no USB\n"
+            "3) Clique em “Detectar joystick” (ou escolha a porta e Conectar)",
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+        row = ttk.Frame(step1)
+        row.pack(fill=tk.X, pady=(8, 0))
+        self.port_combo = ttk.Combobox(row, textvariable=self.port_var, state="readonly", width=52)
         self.port_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(row, text="Atualizar", command=self.refresh_ports).pack(side=tk.LEFT, padx=(6, 0))
-        btns = ttk.Frame(conn)
+        ttk.Button(row, text="Atualizar lista", command=lambda: self.refresh_ports(True)).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+        btns = ttk.Frame(step1)
         btns.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(btns, text="Detectar joystick", command=self.detect_stick).pack(side=tk.LEFT)
         self.btn_connect = ttk.Button(btns, text="Conectar", command=self.toggle_connect)
-        self.btn_connect.pack(side=tk.LEFT)
-        ttk.Label(btns, textvariable=self.status).pack(side=tk.LEFT, padx=10)
+        self.btn_connect.pack(side=tk.LEFT, padx=8)
+        ttk.Label(btns, textvariable=self.status, wraplength=320).pack(side=tk.LEFT)
 
-        live = ttk.LabelFrame(root, text="Leitura ao vivo (mV)", padding=10)
-        live.pack(fill=tk.X, **pad)
-        ttk.Label(live, text="X (AIN0):").grid(row=0, column=0, sticky=tk.W)
-        ttk.Label(live, textvariable=self.live_x, font=("Segoe UI", 14, "bold")).grid(
-            row=0, column=1, sticky=tk.W, padx=8
+        # Passo 2
+        step2 = ttk.LabelFrame(root, text="Passo 2 — Centro (stick parado)", padding=10)
+        step2.pack(fill=tk.X, **pad)
+        ttk.Label(
+            step2,
+            text="Deixe o stick solto no centro. Os números abaixo são a leitura atual. "
+            "Clique em “Usar como centro” para zerar o drift.",
+            wraplength=520,
+        ).pack(anchor=tk.W)
+        live = ttk.Frame(step2)
+        live.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(live, text="X:").pack(side=tk.LEFT)
+        ttk.Label(live, textvariable=self.live_x, font=("Segoe UI", 13, "bold")).pack(
+            side=tk.LEFT, padx=(4, 16)
         )
-        ttk.Label(live, text="Y (AIN1):").grid(row=1, column=0, sticky=tk.W)
-        ttk.Label(live, textvariable=self.live_y, font=("Segoe UI", 14, "bold")).grid(
-            row=1, column=1, sticky=tk.W, padx=8
+        ttk.Label(live, text="Y:").pack(side=tk.LEFT)
+        ttk.Label(live, textvariable=self.live_y, font=("Segoe UI", 13, "bold")).pack(
+            side=tk.LEFT, padx=(4, 16)
         )
-        ttk.Button(live, text="Capturar centro", command=self.capture_center).grid(
-            row=0, column=2, rowspan=2, padx=12
-        )
+        ttk.Button(live, text="Usar como centro", command=self.capture_center).pack(side=tk.LEFT)
 
-        cal = ttk.LabelFrame(root, text="Calibração", padding=10)
-        cal.pack(fill=tk.X, **pad)
+        # Passo 3
+        step3 = ttk.LabelFrame(root, text="Passo 3 — Ajustes finos", padding=10)
+        step3.pack(fill=tk.X, **pad)
+        step3.columnconfigure(1, weight=1)
 
-        def add_scale(parent, row, label, var, from_, to, tick=None):
-            ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=4)
+        def add_scale(row, label, help_text, var, from_, to):
+            ttk.Label(step3, text=label).grid(row=row, column=0, sticky=tk.W, pady=4)
             scale = ttk.Scale(
-                parent,
+                step3,
                 from_=from_,
                 to=to,
                 orient=tk.HORIZONTAL,
@@ -107,47 +168,55 @@ class StickTunerApp(tk.Tk):
             )
             scale.set(var.get())
             scale.grid(row=row, column=1, sticky=tk.EW, padx=8)
-            val = ttk.Label(parent, textvariable=var, width=6)
-            val.grid(row=row, column=2, sticky=tk.E)
+            ttk.Label(step3, textvariable=var, width=6).grid(row=row, column=2, sticky=tk.E)
+            ttk.Label(step3, text=help_text, foreground="#555").grid(
+                row=row + 1, column=1, sticky=tk.W, pady=(0, 4)
+            )
+            var.trace_add("write", lambda *_a, v=var, s=scale: s.set(v.get()))
             return scale
 
-        cal.columnconfigure(1, weight=1)
-        self.scale_mid_x = add_scale(cal, 0, "Centro X", self.mid_x, 0, 12000)
-        self.scale_mid_y = add_scale(cal, 1, "Centro Y", self.mid_y, 0, 12000)
-        self.scale_dz = add_scale(cal, 2, "Deadzone", self.deadzone, 0, 255)
-        self.scale_div = add_scale(cal, 3, "Velocidade (divisor)", self.divisor, 50, 1000)
-        ttk.Label(cal, text="(maior = mais lento)").grid(row=4, column=1, sticky=tk.W)
-        ttk.Checkbutton(cal, text="Inverter eixo Y", variable=self.invert_y).grid(
-            row=5, column=0, columnspan=2, sticky=tk.W, pady=6
+        add_scale(0, "Centro X", "Ajuste fino se ainda puxar para os lados", self.mid_x, 0, 12000)
+        add_scale(2, "Centro Y", "Ajuste fino se ainda puxar para cima/baixo", self.mid_y, 0, 12000)
+        add_scale(
+            4,
+            "Zona morta",
+            "Maior = menos drift parado; alto demais deixa o stick “morto” no meio",
+            self.deadzone,
+            0,
+            255,
         )
+        add_scale(
+            6,
+            "Velocidade",
+            "Número MAIOR = cursor MAIS LENTO (mesmo no máximo de inclinação)",
+            self.divisor,
+            50,
+            1000,
+        )
+        ttk.Checkbutton(
+            step3,
+            text="Inverter cima/baixo",
+            variable=self.invert_y,
+        ).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=6)
 
-        actions = ttk.Frame(root)
-        actions.pack(fill=tk.X, **pad)
-        ttk.Button(actions, text="Ler do stick", command=self.read_from_stick).pack(side=tk.LEFT)
-        ttk.Button(actions, text="Aplicar", command=self.apply_settings).pack(side=tk.LEFT, padx=8)
+        # Passo 4
+        step4 = ttk.LabelFrame(root, text="Passo 4 — Salvar na placa", padding=10)
+        step4.pack(fill=tk.X, **pad)
+        ttk.Label(
+            step4,
+            text="Salvar envia os ajustes e grava na memória da placa "
+            "(continua depois de desligar o USB).",
+            wraplength=520,
+        ).pack(anchor=tk.W)
+        actions = ttk.Frame(step4)
+        actions.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(actions, text="Ler da placa", command=self.read_from_stick).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Salvar", command=self.save_settings).pack(side=tk.LEFT, padx=8)
 
         log_frame = ttk.LabelFrame(root, text="Log", padding=8)
         log_frame.pack(fill=tk.BOTH, expand=True, **pad)
-        self.log = tk.Text(log_frame, height=10, wrap=tk.WORD, state=tk.DISABLED)
+        self.log = tk.Text(log_frame, height=8, wrap=tk.WORD, state=tk.DISABLED)
         self.log.pack(fill=tk.BOTH, expand=True)
-        scroll = ttk.Scrollbar(self.log, command=self.log.yview)
-        self.log.configure(yscrollcommand=scroll.set)
-
-        tip = ttk.Label(
-            root,
-            text="Dica: use a porta do PSP Stick, não a Sofle. Firmware precisa dos comandos stick.",
-            foreground="#555",
-        )
-        tip.pack(fill=tk.X, padx=10, pady=(0, 4))
-
-        # keep scales in sync when IntVar changes programmatically
-        for var, scale in (
-            (self.mid_x, self.scale_mid_x),
-            (self.mid_y, self.scale_mid_y),
-            (self.deadzone, self.scale_dz),
-            (self.divisor, self.scale_div),
-        ):
-            var.trace_add("write", lambda *_a, v=var, s=scale: s.set(v.get()))
 
     def log_line(self, text: str):
         def _append():
@@ -158,17 +227,20 @@ class StickTunerApp(tk.Tk):
 
         self.after(0, _append)
 
-    def refresh_ports(self):
-        ports = list_serial_ports()
-        labels = [label for _, label, _ in ports]
-        self._port_map = {label: dev for dev, label, _ in ports}
+    def refresh_ports(self, select_best: bool = False):
+        ports = list_candidate_ports()
+        labels = [p["label"] for p in ports]
+        self._port_map = {p["label"]: p["device"] for p in ports}
         self.port_combo["values"] = labels
-        # Prefer PSP Stick
-        preferred = next((lbl for _, lbl, meta in ports if "PSP" in meta or "PSP" in lbl), None)
-        if preferred:
-            self.port_var.set(preferred)
-        elif labels and not self.port_var.get():
-            self.port_var.set(labels[0])
+        if not labels:
+            self.port_var.set("")
+            self.status.set("Nenhuma porta serial encontrada. Conecte o stick no USB.")
+            return
+        if select_best or self.port_var.get() not in self._port_map:
+            preferred = next((p for p in ports if p["is_psp"]), None)
+            if not preferred:
+                preferred = next((p for p in ports if p["is_zmk"]), ports[0])
+            self.port_var.set(preferred["label"])
 
     def toggle_connect(self):
         if self.ser and self.ser.is_open:
@@ -176,28 +248,30 @@ class StickTunerApp(tk.Tk):
         else:
             self.connect()
 
-    def connect(self):
-        label = self.port_var.get()
-        if not label or label not in getattr(self, "_port_map", {}):
-            messagebox.showwarning("Porta", "Escolha uma porta serial.")
-            return
-        dev = self._port_map[label]
+    def connect(self, device: str | None = None):
+        if device is None:
+            label = self.port_var.get()
+            if not label or label not in self._port_map:
+                messagebox.showwarning("Porta", "Escolha uma porta serial na lista.")
+                return False
+            device = self._port_map[label]
         try:
-            self.ser = serial.Serial(dev, BAUD, timeout=0.05)
-            time.sleep(0.3)
+            self.ser = serial.Serial(device, BAUD, timeout=0.05)
+            time.sleep(0.35)
             self.ser.reset_input_buffer()
         except serial.SerialException as exc:
-            messagebox.showerror("Erro", f"Não foi possível abrir {dev}:\n{exc}")
+            messagebox.showerror("Erro", f"Não foi possível abrir {device}:\n{exc}")
             self.ser = None
-            return
+            return False
 
         self.reader_stop.clear()
         self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self.reader_thread.start()
         self.btn_connect.configure(text="Desconectar")
-        self.status.set(f"Conectado em {dev}")
-        self.log_line(f"== conectado {dev} ==")
-        self.after(500, self.read_from_stick)
+        self.status.set(f"Conectado em {device}")
+        self.log_line(f"== conectado {device} ==")
+        self.after(400, self.read_from_stick)
+        return True
 
     def disconnect(self):
         self.reader_stop.set()
@@ -214,6 +288,62 @@ class StickTunerApp(tk.Tk):
         self.status.set("Desconectado")
         self.log_line("== desconectado ==")
 
+    def detect_stick(self):
+        """Abre portas ZMK e procura resposta a 'stick get'."""
+        if self.ser and self.ser.is_open:
+            self.disconnect()
+        self.refresh_ports(select_best=True)
+        ports = list_candidate_ports()
+        candidates = [p for p in ports if p["is_zmk"] or p["is_psp"]] or ports
+        self.status.set("Procurando joystick…")
+        self.update_idletasks()
+
+        for p in candidates:
+            self.log_line(f"testando {p['device']}…")
+            try:
+                ser = serial.Serial(p["device"], BAUD, timeout=0.2)
+            except serial.SerialException:
+                continue
+            try:
+                time.sleep(0.25)
+                ser.reset_input_buffer()
+                ser.write(b"stick get\n")
+                ser.flush()
+                deadline = time.time() + 1.5
+                buf = ""
+                found = False
+                while time.time() < deadline:
+                    chunk = ser.read(256)
+                    if chunk:
+                        buf += chunk.decode("utf-8", errors="ignore")
+                        if "STICK OK" in buf:
+                            found = True
+                            break
+                    time.sleep(0.05)
+            finally:
+                ser.close()
+
+            if found:
+                # select in combo
+                for label, dev in self._port_map.items():
+                    if dev == p["device"]:
+                        self.port_var.set(label)
+                        break
+                self.log_line(f"joystick encontrado em {p['device']}")
+                self.connect(p["device"])
+                messagebox.showinfo("Detectado", f"Joystick encontrado na porta {p['device']}.")
+                return
+
+        self.status.set("Não achei o joystick")
+        messagebox.showwarning(
+            "Não encontrado",
+            "Não recebi resposta do joystick.\n\n"
+            "Confira:\n"
+            "• A placa está no USB?\n"
+            "• O firmware tem suporte ao tuner (comandos stick)?\n"
+            "• Feche outros programas usando a porta COM (PuTTY, etc.).",
+        )
+
     def _reader_loop(self):
         buf = ""
         while not self.reader_stop.is_set():
@@ -228,7 +358,7 @@ class StickTunerApp(tk.Tk):
                     line, buf = buf.split("\n", 1)
                     self._handle_line(line.strip("\r"))
             except serial.SerialException:
-                self.after(0, lambda: self.status.set("Porta perdida"))
+                self.after(0, lambda: self.status.set("Porta perdida — reconecte o USB"))
                 break
             except Exception as exc:
                 self.log_line(f"reader: {exc}")
@@ -255,7 +385,6 @@ class StickTunerApp(tk.Tk):
             self.log_line(line)
             if sm.group(1) == "OK":
                 self._parse_stick_ok(sm.group(2))
-            return
 
     def _parse_stick_ok(self, rest: str):
         def grab(name):
@@ -278,20 +407,19 @@ class StickTunerApp(tk.Tk):
 
     def send_cmd(self, cmd: str, wait_ok: bool = True) -> bool:
         if not self.ser or not self.ser.is_open:
-            messagebox.showwarning("Serial", "Conecte primeiro.")
+            messagebox.showwarning("Serial", "Conecte o joystick primeiro (Passo 1).")
             return False
         self._last_reply = ""
-        payload = (cmd.strip() + "\n").encode("utf-8")
         self.log_line(f"> {cmd}")
         try:
-            self.ser.write(payload)
+            self.ser.write((cmd.strip() + "\n").encode("utf-8"))
             self.ser.flush()
         except serial.SerialException as exc:
             messagebox.showerror("Serial", str(exc))
             return False
         if not wait_ok:
             return True
-        deadline = time.time() + 2.0
+        deadline = time.time() + 2.5
         while time.time() < deadline:
             if self._last_reply.startswith("STICK OK"):
                 return True
@@ -299,11 +427,12 @@ class StickTunerApp(tk.Tk):
                 return False
             time.sleep(0.05)
             self.update_idletasks()
-        self.log_line("! timeout esperando STICK OK (firmware sem shell?)")
+        self.log_line("! timeout — a placa não respondeu ao comando stick")
         return False
 
     def read_from_stick(self):
-        self.send_cmd("stick get")
+        if self.send_cmd("stick get"):
+            self.status.set("Valores lidos da placa")
 
     def capture_center(self):
         with self.lock:
@@ -311,8 +440,9 @@ class StickTunerApp(tk.Tk):
             ys = list(self._mv_hist.get(1, []))
         if len(xs) < 5 or len(ys) < 5:
             messagebox.showinfo(
-                "Capturar centro",
-                "Aguarde alguns segundos conectado para acumular leituras X/Y.",
+                "Centro",
+                "Aguarde 1–2 segundos conectado com o stick parado "
+                "para acumular leituras X/Y.",
             )
             return
         mx = int(sum(xs) / len(xs))
@@ -320,25 +450,29 @@ class StickTunerApp(tk.Tk):
         self.mid_x.set(mx)
         self.mid_y.set(my)
         self.log_line(f"centro capturado mid_x={mx} mid_y={my}")
+        self.status.set(f"Centro definido: X={mx} Y={my}")
 
-    def apply_settings(self):
+    def save_settings(self):
+        """Aplica na hora e grava na flash (stick save)."""
         ok = True
         ok &= self.send_cmd(f"stick mid {self.mid_x.get()} {self.mid_y.get()}")
         ok &= self.send_cmd(f"stick deadzone {self.deadzone.get()}")
         ok &= self.send_cmd(f"stick divisor {self.divisor.get()}")
         ok &= self.send_cmd(f"stick invert_y {1 if self.invert_y.get() else 0}")
+        ok &= self.send_cmd("stick save")
         if ok:
-            self.status.set("Calibração aplicada (RAM)")
+            self.status.set("Salvo na placa")
             messagebox.showinfo(
-                "Aplicado",
-                "Valores enviados ao stick.\n"
-                "Valem até reiniciar (ainda não grava na flash).",
+                "Salvo",
+                "Calibração gravada na placa.\n"
+                "Pode desconectar o USB — os valores permanecem.",
             )
         else:
             messagebox.showwarning(
-                "Falha",
-                "Não recebi STICK OK.\n"
-                "Confirme que flashou o firmware com shell do tuner.",
+                "Falha ao salvar",
+                "A placa não confirmou o comando.\n\n"
+                "Use o firmware mais recente do projeto zmk-analog-rp2040 "
+                "(com shell do tuner) e feche outros apps na mesma porta COM.",
             )
 
     def on_close(self):
@@ -346,5 +480,10 @@ class StickTunerApp(tk.Tk):
         self.destroy()
 
 
+def main():
+    app = StickTunerApp()
+    app.mainloop()
+
+
 if __name__ == "__main__":
-    StickTunerApp().mainloop()
+    main()
