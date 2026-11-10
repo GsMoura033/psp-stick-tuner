@@ -494,22 +494,38 @@ class StickTunerApp(tk.Tk):
         self.status.set(f"Centro: X={mx} Y={my}")
 
     def save_settings(self):
-        ok = True
-        ok &= self.send_cmd(f"stick mid {self.mid_x.get()} {self.mid_y.get()}")
-        ok &= self.send_cmd(f"stick deadzone {self.deadzone.get()}")
-        ok &= self.send_cmd(f"stick divisor {self.divisor.get()}")
-        ok &= self.send_cmd(f"stick invert_y {1 if self.invert_y.get() else 0}")
-        ok &= self.send_cmd("stick save")
-        if ok:
-            self.status.set("Salvo na placa")
-            messagebox.showinfo("Salvo", "Calibração gravada. Pode desconectar o USB.")
-        else:
+        applied = True
+        applied &= self.send_cmd(f"stick mid {self.mid_x.get()} {self.mid_y.get()}")
+        applied &= self.send_cmd(f"stick deadzone {self.deadzone.get()}")
+        applied &= self.send_cmd(f"stick divisor {self.divisor.get()}")
+        applied &= self.send_cmd(f"stick invert_y {1 if self.invert_y.get() else 0}")
+        if not applied:
             messagebox.showwarning(
-                "Falha ao salvar",
-                "A placa não confirmou.\n\n"
-                "Flash o firmware mais recente do zmk-analog-rp2040 "
-                "e feche outros apps na mesma COM.",
+                "Falha",
+                "A placa não aceitou os ajustes.\n\n"
+                "Confirme a conexão e o firmware com comandos stick.",
             )
+            return
+
+        # Persistência na flash (firmware recente com "stick save")
+        saved = self.send_cmd("stick save")
+        if saved:
+            self.status.set("Salvo na placa (flash)")
+            messagebox.showinfo(
+                "Salvo",
+                "Calibração gravada na memória da placa.\n"
+                "Pode desconectar o USB — os valores permanecem.",
+            )
+            return
+
+        self.status.set("Aplicado agora (ainda não gravado na flash)")
+        messagebox.showwarning(
+            "Aplicado, mas não gravado",
+            "Os ajustes JÁ ESTÃO valendo agora no mouse.\n\n"
+            "Porém a placa não gravou na flash (comando stick save).\n"
+            "Flash o firmware mais recente do repositório zmk-analog-rp2040 "
+            "e clique em Salvar de novo para manter depois de desligar.",
+        )
 
     def on_close(self):
         try:
