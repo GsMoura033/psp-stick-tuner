@@ -408,20 +408,32 @@ class StickTunerApp(tk.Tk):
                 self.log_line(f"reader: {exc}")
                 time.sleep(0.05)
 
+    def _set_live(self, x: int | None = None, y: int | None = None):
+        if x is not None:
+            with self.lock:
+                self._mv_hist[0].append(x)
+            self._ui_x = x
+        if y is not None:
+            with self.lock:
+                self._mv_hist[1].append(y)
+            self._ui_y = y
+        # Atualiza UI no próximo tick (coalescido)
+        if not getattr(self, "_live_ui_pending", False):
+            self._live_ui_pending = True
+            self.after(0, self._flush_live_ui)
+
     def _handle_line(self, line: str):
         if not line:
             return
-        # Firmware antigo ainda pode spit AIN; aceita sem floodar a UI
+        # Logs AIN (firmware com DBG_RAW rate-limited)
         m = AIN_RE.search(line)
         if m:
             idx = int(m.group(1))
             mv = int(m.group(3))
-            with self.lock:
-                self._mv_hist.setdefault(idx, deque(maxlen=20)).append(mv)
             if idx == 0:
-                self._ui_x = mv
+                self._set_live(x=mv)
             elif idx == 1:
-                self._ui_y = mv
+                self._set_live(y=mv)
             return
 
         sm = STICK_RE.search(line)
@@ -430,16 +442,17 @@ class StickTunerApp(tk.Tk):
             rest = sm.group(2)
             lm = LIVE_RE.search(rest)
             if lm:
-                x, y = int(lm.group(1)), int(lm.group(2))
-                with self.lock:
-                    self._mv_hist[0].append(x)
-                    self._mv_hist[1].append(y)
-                self._ui_x, self._ui_y = x, y
-            elif sm.group(1) == "OK" and "live_x=" not in rest:
+                self._set_live(x=int(lm.group(1)), y=int(lm.group(2)))
+            if sm.group(1) == "OK" and "mid_x=" in rest:
                 self.log_line(line)
                 self.after(0, lambda r=rest: self._parse_stick_ok(r))
+            elif sm.group(1) == "OK" and "saved" in rest:
+                self.log_line(line)
+            elif sm.group(1) == "ERR":
+                self.log_line(line)
 
     def _flush_live_ui(self):
+        self._live_ui_pending = False
         if self._ui_x is not None:
             self.live_x.set(str(self._ui_x))
         if self._ui_y is not None:
@@ -449,10 +462,10 @@ class StickTunerApp(tk.Tk):
         self._flush_live_ui()
         if not self.ser or not self.ser.is_open:
             return
-        # Poll leve ~4 Hz; não bloqueia a UI
+        # Poll leve; aceita stick live OU AIN espontâneo
         if not self.busy:
             self._write_raw("stick live\n")
-        self._live_job = self.after(250, self._schedule_live_poll)
+        self._live_job = self.after(300, self._schedule_live_poll)
 
     def _parse_stick_ok(self, rest: str):
         def grab(name):
