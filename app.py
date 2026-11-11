@@ -374,7 +374,7 @@ class StickTunerApp(tk.Tk):
         titles = ttk.Frame(top)
         titles.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Label(titles, text="PSP Stick Tuner", style="Title.TLabel").pack(anchor=tk.W)
-        link = ttk.Label(titles, text="gsmoura.com.br · software sob medida", style="Accent.TLabel", cursor="hand2")
+        link = ttk.Label(titles, text="gsmoura.com.br", style="Accent.TLabel", cursor="hand2")
         link.pack(anchor=tk.W, pady=(2, 0))
         link.bind("<Button-1>", lambda _e: webbrowser.open(SITE_URL))
 
@@ -510,7 +510,7 @@ class StickTunerApp(tk.Tk):
         foot.pack(fill=tk.X)
         ttk.Label(
             foot,
-            text="Feito por Gustavo Moura · GV, MG",
+            text="Feito por Gustavo Moura",
             style="Muted.TLabel",
         ).pack(side=tk.LEFT)
         site = ttk.Label(foot, text=SITE_URL.replace("https://", ""), style="Accent.TLabel", cursor="hand2")

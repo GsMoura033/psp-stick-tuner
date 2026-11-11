@@ -2,7 +2,8 @@
 
 Calibre o joystick USB (firmware ZMK) sem terminal e sem Python.
 
-Feito por **[Gustavo Moura](https://gsmoura.com.br)** · software sob medida · GV, MG  
+Feito por **[Gustavo Moura](https://gsmoura.com.br)**  
+
 Firmware companion: [zmk-analog-rp2040](https://github.com/GsMoura033/zmk-analog-rp2040)
 
 [![Build Windows exe](https://github.com/GsMoura033/psp-stick-tuner/actions/workflows/build-exe.yml/badge.svg)](https://github.com/GsMoura033/psp-stick-tuner/actions/workflows/build-exe.yml)
