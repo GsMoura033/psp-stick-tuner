@@ -9,11 +9,24 @@ Firmware companion: [zmk-analog-rp2040](https://github.com/GsMoura033/zmk-analog
 [![Build Windows exe](https://github.com/GsMoura033/psp-stick-tuner/actions/workflows/build-exe.yml/badge.svg)](https://github.com/GsMoura033/psp-stick-tuner/actions/workflows/build-exe.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-lime.svg)](LICENSE)
 
+## Compatibilidade
+
+| O quê | Windows 10/11 | Windows XP | Linux |
+|---|---|---|---|
+| **Stick como mouse USB** (depois de calibrado) | Sim | Sim | Sim |
+| **`PSP-Stick-Tuner.exe`** | Sim | Não | Não (é binário Windows) |
+| **Tuner pelo código** (`python app.py`) | Sim | Não | Sim (com Python 3 + pyserial) |
+
+A calibração fica **na flash da placa**, não no PC. Calibre uma vez → use em qualquer máquina.
+
+- **XP:** use o stick como mouse; **não** rode o `.exe` lá. Calibre no Win10/11 e pluggue no XP.
+- **Linux:** o `.exe` **não** roda nativamente (Wine pode falhar). No Linux use `python app.py`, ou calibre no Windows e só use o stick.
+
 ## Baixar o executável
 
 1. Abra **[Releases](https://github.com/GsMoura033/psp-stick-tuner/releases)**
 2. Baixe `PSP-Stick-Tuner.exe`
-3. Rode (Windows). Não precisa instalar Python.
+3. Rode no **Windows 10/11** (64-bit recomendado). Não precisa instalar Python.
 
 Também dá para pegar o artefato do Actions (**PSP-Stick-Tuner-windows**) em qualquer build verde da `main`.
 
@@ -21,17 +34,12 @@ Também dá para pegar o artefato do Actions (**PSP-Stick-Tuner-windows**) em qu
 
 1. Flash o firmware do stick ([zmk-analog-rp2040 Actions](https://github.com/GsMoura033/zmk-analog-rp2040/actions))
 2. Ligue o módulo: **VCC → 3,3 V** (nunca 5 V no ADC), GND, VRx/VRy nos ADCs
-3. USB na placa → abra o tuner
+3. USB na placa → abra o tuner (**Win10/11**)
 4. **Detectar joystick** (escolhe a COM que responde — não depende de COM fixa)
 5. Stick parado → **Usar como centro**
 6. Ajuste zona morta / velocidade / inverter eixos → **Salvar**
 
-> **Salvar** grava a calibração **na flash da placa**. Depois disso o stick funciona em qualquer PC (incluindo Windows XP como mouse USB), sem depender deste computador.
-
-### Windows XP
-
-- **Usar o stick no XP:** sim — depois de calibrar e salvar na placa (em um PC com Win10/11), é só um mouse USB.
-- **Rodar o `.exe` do tuner no XP:** não. O executável atual é para **Windows 10/11**. Calibre no PC moderno, use no XP.
+> **Salvar** grava na **memória da placa**. Depois o stick funciona em qualquer PC/SO como mouse USB.
 
 ### Controles
 
@@ -46,6 +54,8 @@ Também dá para pegar o artefato do Actions (**PSP-Stick-Tuner-windows**) em qu
 
 ## Rodar do código
 
+**Windows (PowerShell):**
+
 ```powershell
 cd psp-stick-tuner
 python -m venv .venv
@@ -53,6 +63,18 @@ python -m venv .venv
 pip install -r requirements.txt
 python app.py
 ```
+
+**Linux:**
+
+```bash
+cd psp-stick-tuner
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python app.py
+```
+
+O usuário do dialout/`uucp` precisa acessar a porta serial (`/dev/ttyACM*` etc.).
 
 ### Gerar o `.exe` localmente
 

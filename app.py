@@ -447,7 +447,8 @@ class StickTunerApp(tk.Tk):
 
         ttk.Label(
             body,
-            text="Salvar grava na memória da placa. Vale em qualquer PC (incluindo XP como mouse).",
+            text="Salvar grava na placa (não no PC). Depois funciona em qualquer máquina "
+            "como mouse — XP incluso. O .exe do tuner é só Windows 10/11 (não XP/Linux).",
             style="Muted.TLabel",
             wraplength=500,
         ).pack(anchor=tk.W, padx=8, pady=(4, 6))
@@ -846,9 +847,11 @@ class StickTunerApp(tk.Tk):
                     self.status.set("Salvo na placa"),
                     messagebox.showinfo(
                         "Salvo na placa",
-                        "Calibração gravada na memória do stick.\n"
-                        "Pode usar em qualquer PC — inclusive Windows XP como mouse.\n"
-                        "(O app de calibração em si precisa de Windows 10/11.)",
+                        "Calibração gravada na memória do stick.\n\n"
+                        "Pode usar em qualquer PC/SO como mouse USB "
+                        "(incluindo Windows XP).\n"
+                        "Este app (.exe) é só para Windows 10/11 — "
+                        "não roda no XP nem nativamente no Linux.",
                     ),
                 ),
             )
