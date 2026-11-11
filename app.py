@@ -288,7 +288,33 @@ class StickTunerApp(tk.Tk):
         style.map("Accent.TButton", background=[("active", "#d8ff4a"), ("disabled", "#5a6a20")])
         style.configure("TCheckbutton", background=BRAND_BG, foreground=BRAND_FG)
         style.map("TCheckbutton", background=[("active", BRAND_BG)])
-        style.configure("TCombobox", fieldbackground=BRAND_PANEL, background=BRAND_PANEL, foreground=BRAND_FG)
+        style.configure(
+            "TCombobox",
+            fieldbackground=BRAND_PANEL,
+            background=BRAND_PANEL,
+            foreground=BRAND_FG,
+            arrowcolor=BRAND_ACCENT,
+            bordercolor=BRAND_BORDER,
+            lightcolor=BRAND_BORDER,
+            darkcolor=BRAND_BORDER,
+            insertcolor=BRAND_FG,
+            padding=4,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", BRAND_PANEL), ("!disabled", BRAND_PANEL)],
+            foreground=[("readonly", BRAND_FG), ("!disabled", BRAND_FG)],
+            selectbackground=[("readonly", BRAND_PANEL)],
+            selectforeground=[("readonly", BRAND_FG)],
+            background=[("readonly", BRAND_PANEL), ("active", BRAND_PANEL)],
+            arrowcolor=[("readonly", BRAND_ACCENT)],
+        )
+        # Lista dropdown do Combobox (widget nativo — option_add)
+        self.option_add("*TCombobox*Listbox.background", BRAND_PANEL)
+        self.option_add("*TCombobox*Listbox.foreground", BRAND_FG)
+        self.option_add("*TCombobox*Listbox.selectBackground", BRAND_ACCENT)
+        self.option_add("*TCombobox*Listbox.selectForeground", BRAND_BG)
+        self.option_add("*TCombobox*Listbox.font", "{Segoe UI} 9")
         style.configure("Horizontal.TScale", background=BRAND_BG, troughcolor=BRAND_PANEL)
         style.configure("Vertical.TScrollbar", background=BRAND_PANEL, troughcolor=BRAND_BG)
 
@@ -396,6 +422,8 @@ class StickTunerApp(tk.Tk):
         row.pack(fill=tk.X)
         self.port_combo = ttk.Combobox(row, textvariable=self.port_var, state="readonly")
         self.port_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # Garante popdown legível depois do widget existir (Windows)
+        self.after(0, self._style_combobox_popdown)
         ttk.Button(row, text="Atualizar", command=lambda: self.refresh_ports(True)).pack(
             side=tk.LEFT, padx=(6, 0)
         )
@@ -510,6 +538,18 @@ class StickTunerApp(tk.Tk):
         if status:
             self.status.set(status)
 
+    def _style_combobox_popdown(self):
+        try:
+            popdown = self.tk.call("ttk::combobox::PopdownWindow", self.port_combo)
+            listbox = f"{popdown}.f.l"
+            self.tk.call(listbox, "configure", "-background", BRAND_PANEL)
+            self.tk.call(listbox, "configure", "-foreground", BRAND_FG)
+            self.tk.call(listbox, "configure", "-selectbackground", BRAND_ACCENT)
+            self.tk.call(listbox, "configure", "-selectforeground", BRAND_BG)
+            self.tk.call(listbox, "configure", "-font", "{Segoe UI} 9")
+        except tk.TclError:
+            pass
+
     def refresh_ports(self, select_best: bool = False):
         ports = list_candidate_ports()
         labels = [p["label"] for p in ports]
@@ -522,6 +562,7 @@ class StickTunerApp(tk.Tk):
         # Só preenche a lista — a porta certa vem do Detectar/Conectar (probe)
         if self.port_var.get() not in self._port_map:
             self.port_var.set(labels[0] if labels else "")
+        self.after(50, self._style_combobox_popdown)
 
     def toggle_connect(self):
         if self.ser and self.ser.is_open:
