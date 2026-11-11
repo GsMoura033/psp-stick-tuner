@@ -1,30 +1,45 @@
 # PSP Stick Tuner
 
-Aplicativo para **calibrar o joystick USB** (firmware ZMK do projeto [zmk-analog-rp2040](https://github.com/GsMoura033/zmk-analog-rp2040)).
+Calibre o joystick USB (firmware ZMK) sem terminal e sem Python.
 
-Não precisa instalar Python se você baixar o **executável** na página de Releases.
+Feito por **[Gustavo Moura](https://gsmoura.com.br)** · software sob medida · GV, MG  
+Firmware companion: [zmk-analog-rp2040](https://github.com/GsMoura033/zmk-analog-rp2040)
 
-## Para quem só quer usar
+[![Build Windows exe](https://github.com/GsMoura033/psp-stick-tuner/actions/workflows/build-exe.yml/badge.svg)](https://github.com/GsMoura033/psp-stick-tuner/actions/workflows/build-exe.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-lime.svg)](LICENSE)
 
-1. Flash o firmware do stick (artefato do GitHub Actions em `zmk-analog-rp2040`).
-2. Ligue o joystick na placa (**VCC → 3,3 V**, nunca 5 V direto no ADC).
-3. Conecte a placa no USB.
-4. Baixe `PSP-Stick-Tuner.exe` em [Releases](https://github.com/GsMoura033/psp-stick-tuner/releases).
-5. Abra o app → **Detectar joystick** → ajuste → **Salvar**.
+## Baixar o executável
 
-### O que cada ajuste faz
+1. Abra **[Releases](https://github.com/GsMoura033/psp-stick-tuner/releases)**
+2. Baixe `PSP-Stick-Tuner.exe`
+3. Rode (Windows). Não precisa instalar Python.
+
+Também dá para pegar o artefato do Actions (**PSP-Stick-Tuner-windows**) em qualquer build verde da `main`.
+
+## Uso rápido
+
+1. Flash o firmware do stick ([zmk-analog-rp2040 Actions](https://github.com/GsMoura033/zmk-analog-rp2040/actions))
+2. Ligue o módulo: **VCC → 3,3 V** (nunca 5 V no ADC), GND, VRx/VRy nos ADCs
+3. USB na placa → abra o tuner
+4. **Detectar joystick** (escolhe a COM que responde — não depende de COM fixa)
+5. Stick parado → **Usar como centro**
+6. Ajuste zona morta / velocidade / inverter eixos → **Salvar**
+
+> **Salvar** aplica na placa **e** guarda a calibração neste PC.  
+> No próximo **Conectar**, o app reaplica sozinho (a flash NVS do RP2040 pode travar — por isso a persistência é no host).
+
+### Controles
 
 | Controle | Função |
 |---|---|
-| **Usar como centro** | Com o stick parado, define o “zero” para não driftar |
-| **Zona morta** | Ignora tremores no meio (maior = mais estável parado) |
-| **Velocidade** | Número **maior** = cursor **mais lento** (mesmo no máximo de inclinação) |
-| **Inverter cima/baixo** | Troca o sentido do eixo Y |
-| **Salvar** | Envia os valores **e grava na memória da placa** |
+| **Detectar** | Testa as COMs ZMK e conecta na que responde ao `stick` |
+| **Usar como centro** | Define o zero com o stick parado |
+| **Zona morta** | Maior = menos tremor parado |
+| **Velocidade** | **Maior = mais lento** no máximo de inclinação |
+| **Inverter X / Y** | Espelha esquerda-direita ou cima-baixo |
+| **Salvar** | Aplica na placa + JSON local |
 
-A inclinação do stick controla a velocidade (é analógico). O app limita o quanto ele anda no máximo.
-
-## Desenvolvedores (rodar do código)
+## Rodar do código
 
 ```powershell
 cd psp-stick-tuner
@@ -34,26 +49,36 @@ pip install -r requirements.txt
 python app.py
 ```
 
-### Gerar o .exe localmente
+### Gerar o `.exe` localmente
 
 ```powershell
-pip install pyinstaller
-pyinstaller --noconfirm --onefile --windowed --name PSP-Stick-Tuner app.py
+pip install pyinstaller pillow
+pyinstaller --noconfirm --onefile --windowed --name PSP-Stick-Tuner --icon assets/icon.ico app.py
 ```
 
-O executável sai em `dist\PSP-Stick-Tuner.exe`.
+Saída: `dist\PSP-Stick-Tuner.exe`
 
-## Protocolo serial (COM)
+## Protocolo serial
 
-Baud 115200. Comandos:
+Baud **115200**. Comandos:
 
 ```
 stick get
+stick live
 stick mid <x> <y>
 stick deadzone <n>
 stick divisor <n>
+stick invert_x <0|1>
 stick invert_y <0|1>
 stick save
 ```
 
-Respostas: `STICK OK ...` ou `STICK ERR ...`.
+Respostas: `STICK OK ...` / `STICK ERR ...`
+
+## Licença
+
+MIT © 2026 Gustavo Moura — veja [LICENSE](LICENSE).
+
+---
+
+Sites, sistemas e automações: **[gsmoura.com.br](https://gsmoura.com.br)**

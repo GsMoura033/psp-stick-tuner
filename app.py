@@ -3,15 +3,29 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import queue
 import re
+import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from collections import deque
 from pathlib import Path
 from tkinter import messagebox, ttk
+
+# Brand (gsmoura.com.br)
+BRAND_BG = "#080808"
+BRAND_PANEL = "#121212"
+BRAND_FG = "#f2f2f2"
+BRAND_MUTED = "#9a9a9a"
+BRAND_ACCENT = "#c8f135"
+BRAND_BORDER = "#2a2a2a"
+SITE_URL = "https://gsmoura.com.br"
+APP_DIR = Path(__file__).resolve().parent
+ICON_PATH = APP_DIR / "assets" / "icon.ico"
 
 try:
     import serial
@@ -26,6 +40,60 @@ BAUD = 115200
 ZMK_VID = 0x1D50
 ZMK_PID = 0x615E
 CALIB_PATH = Path.home() / "AppData" / "Local" / "psp-stick-tuner" / "calib.json"
+LOCK_PATH = Path.home() / "AppData" / "Local" / "psp-stick-tuner" / "app.lock"
+
+
+def acquire_single_instance() -> object | None:
+    """Impede várias janelas do tuner (travam a COM no Windows)."""
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fp = open(LOCK_PATH, "a+b")
+    except OSError:
+        return None
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            fp.seek(0)
+            msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fp.close()
+        return None
+
+    def _release():
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                fp.seek(0)
+                msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
+            fp.close()
+        except OSError:
+            pass
+
+    atexit.register(_release)
+    return fp
+
+
+def port_is_free(device: str) -> bool:
+    try:
+        ser = serial.Serial()
+        ser.port = device
+        ser.baudrate = BAUD
+        ser.timeout = 0.05
+        ser.dsrdtr = False
+        ser.rtscts = False
+        ser.dtr = False
+        ser.rts = False
+        ser.open()
+        ser.close()
+        return True
+    except serial.SerialException:
+        return False
 
 
 def open_serial(device: str, timeout: float = 0.05) -> serial.Serial:
@@ -81,31 +149,55 @@ def list_candidate_ports():
     return ports
 
 
-def probe_stick(device: str, wait_s: float = 3.0) -> bool:
+def probe_stick(device: str, wait_s: float = 3.0) -> dict:
+    """Testa uma COM. score: 0=falha, 1=AIN só, 2=responde stick get."""
+    result = {"device": device, "ok": False, "score": 0, "ain": 0, "error": ""}
     try:
-        ser = open_serial(device, timeout=0.2)
-    except serial.SerialException:
-        return False
+        ser = open_serial(device, timeout=0.15)
+    except serial.SerialException as exc:
+        result["error"] = str(exc)
+        return result
     try:
-        deadline = time.time() + wait_s
+        # Escuta tráfego espontâneo (AIN) — a porta certa do ZMK costuma spit logs
+        t0 = time.time()
         buf = ""
+        while time.time() - t0 < min(0.8, wait_s * 0.25):
+            chunk = ser.read(512)
+            if chunk:
+                txt = chunk.decode("utf-8", errors="ignore")
+                buf += txt
+                result["ain"] += txt.count("AIN")
+        if result["ain"] > 0:
+            result["score"] = 1
+            result["ok"] = True
+
+        deadline = time.time() + wait_s
         next_send = 0.0
         while time.time() < deadline:
             now = time.time()
             if now >= next_send:
                 try:
+                    ser.write(b"\n")
                     ser.write(b"stick get\n")
                     ser.flush()
-                except serial.SerialException:
-                    return False
-                next_send = now + 0.7
+                except serial.SerialException as exc:
+                    result["error"] = str(exc)
+                    return result
+                next_send = now + 0.6
             chunk = ser.read(512)
             if chunk:
-                buf += chunk.decode("utf-8", errors="ignore")
-                if "STICK OK" in buf:
-                    return True
-            time.sleep(0.05)
-        return False
+                txt = chunk.decode("utf-8", errors="ignore")
+                buf += txt
+                result["ain"] += txt.count("AIN")
+                if "STICK OK" in buf or "STICK ERR" in buf:
+                    result["score"] = 2
+                    result["ok"] = True
+                    return result
+            time.sleep(0.04)
+        if result["ain"] > 0:
+            result["score"] = max(result["score"], 1)
+            result["ok"] = True
+        return result
     finally:
         try:
             ser.close()
@@ -113,12 +205,36 @@ def probe_stick(device: str, wait_s: float = 3.0) -> bool:
             pass
 
 
+def find_best_stick_port(candidates: list[dict] | None = None, wait_s: float = 3.0) -> dict | None:
+    """Escolhe a COM pelo que responde — sem preferir número de porta."""
+    ports = candidates or list_candidate_ports()
+    ranked = [p for p in ports if p.get("is_zmk") or p.get("is_psp")] or list(ports)
+    best = None
+    for p in ranked:
+        probe = probe_stick(p["device"], wait_s=wait_s)
+        p = {**p, **probe}
+        if best is None or p["score"] > best["score"]:
+            best = p
+        # stick get é decisivo — pode parar cedo
+        if p["score"] >= 2:
+            return p
+    if best and best.get("score", 0) > 0:
+        return best
+    return None
+
+
 class StickTunerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("PSP Stick Tuner")
-        self.geometry("520x580")
-        self.minsize(460, 440)
+        self.title("PSP Stick Tuner · Gustavo Moura")
+        self.geometry("560x680")
+        self.minsize(500, 520)
+        self.configure(bg=BRAND_BG)
+        if ICON_PATH.exists():
+            try:
+                self.iconbitmap(default=str(ICON_PATH))
+            except tk.TclError:
+                pass
 
         self.ser: serial.Serial | None = None
         self.reader_stop = threading.Event()
@@ -135,6 +251,7 @@ class StickTunerApp(tk.Tk):
         self.mid_y = tk.IntVar(value=9400)
         self.deadzone = tk.IntVar(value=350)
         self.divisor = tk.IntVar(value=500)
+        self.invert_x = tk.BooleanVar(value=False)
         self.invert_y = tk.BooleanVar(value=False)
 
         self._mv_hist = {0: deque(maxlen=20), 1: deque(maxlen=20)}
@@ -144,10 +261,36 @@ class StickTunerApp(tk.Tk):
         self._ui_y = None
         self._live_job = None
 
+        self._setup_style()
         self._build_ui()
         self._load_local_calib()
         self.refresh_ports(select_best=True)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _setup_style(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(".", background=BRAND_BG, foreground=BRAND_FG, fieldbackground=BRAND_PANEL)
+        style.configure("TFrame", background=BRAND_BG)
+        style.configure("TLabel", background=BRAND_BG, foreground=BRAND_FG, font=("Segoe UI", 9))
+        style.configure("Muted.TLabel", background=BRAND_BG, foreground=BRAND_MUTED, font=("Segoe UI", 8))
+        style.configure("Title.TLabel", background=BRAND_BG, foreground=BRAND_FG, font=("Segoe UI Semibold", 15))
+        style.configure("Accent.TLabel", background=BRAND_BG, foreground=BRAND_ACCENT, font=("Segoe UI", 9, "bold"))
+        style.configure("Live.TLabel", background=BRAND_BG, foreground=BRAND_ACCENT, font=("Consolas", 13, "bold"))
+        style.configure("TLabelframe", background=BRAND_BG, foreground=BRAND_FG, bordercolor=BRAND_BORDER)
+        style.configure("TLabelframe.Label", background=BRAND_BG, foreground=BRAND_ACCENT, font=("Segoe UI", 9, "bold"))
+        style.configure("TButton", background=BRAND_PANEL, foreground=BRAND_FG, padding=6, borderwidth=0)
+        style.map("TButton", background=[("active", "#1c1c1c"), ("disabled", "#101010")])
+        style.configure("Accent.TButton", background=BRAND_ACCENT, foreground="#080808", padding=7)
+        style.map("Accent.TButton", background=[("active", "#d8ff4a"), ("disabled", "#5a6a20")])
+        style.configure("TCheckbutton", background=BRAND_BG, foreground=BRAND_FG)
+        style.map("TCheckbutton", background=[("active", BRAND_BG)])
+        style.configure("TCombobox", fieldbackground=BRAND_PANEL, background=BRAND_PANEL, foreground=BRAND_FG)
+        style.configure("Horizontal.TScale", background=BRAND_BG, troughcolor=BRAND_PANEL)
+        style.configure("Vertical.TScrollbar", background=BRAND_PANEL, troughcolor=BRAND_BG)
 
     def _load_local_calib(self):
         try:
@@ -162,6 +305,8 @@ class StickTunerApp(tk.Tk):
             self.deadzone.set(int(data["deadzone"]))
         if "divisor" in data:
             self.divisor.set(int(data["divisor"]))
+        if "invert_x" in data:
+            self.invert_x.set(bool(data["invert_x"]))
         if "invert_y" in data:
             self.invert_y.set(bool(data["invert_y"]))
 
@@ -171,6 +316,7 @@ class StickTunerApp(tk.Tk):
             "mid_y": self.mid_y.get(),
             "deadzone": self.deadzone.get(),
             "divisor": self.divisor.get(),
+            "invert_x": 1 if self.invert_x.get() else 0,
             "invert_y": 1 if self.invert_y.get() else 0,
         }
         try:
@@ -185,29 +331,37 @@ class StickTunerApp(tk.Tk):
     def _apply_current(self) -> bool:
         mx, my = self.mid_x.get(), self.mid_y.get()
         dz, div = self.deadzone.get(), self.divisor.get()
-        inv = 1 if self.invert_y.get() else 0
+        inv_x = 1 if self.invert_x.get() else 0
+        inv_y = 1 if self.invert_y.get() else 0
         results = [
             self.send_cmd(f"stick mid {mx} {my}", expect="mid_x="),
             self.send_cmd(f"stick deadzone {dz}", expect="deadzone="),
             self.send_cmd(f"stick divisor {div}", expect="divisor="),
-            self.send_cmd(f"stick invert_y {inv}", expect="invert_y="),
+            self.send_cmd(f"stick invert_x {inv_x}", expect="invert_x="),
+            self.send_cmd(f"stick invert_y {inv_y}", expect="invert_y="),
         ]
         return any(results)
 
     def _build_ui(self):
-        top = ttk.Frame(self, padding=(12, 10, 12, 6))
+        top = ttk.Frame(self, padding=(14, 12, 14, 8))
         top.pack(fill=tk.X)
-        ttk.Label(top, text="PSP Stick Tuner", font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT)
-        self.btn_save = ttk.Button(top, text="Salvar na placa", command=self.save_settings)
+        titles = ttk.Frame(top)
+        titles.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(titles, text="PSP Stick Tuner", style="Title.TLabel").pack(anchor=tk.W)
+        link = ttk.Label(titles, text="gsmoura.com.br · software sob medida", style="Accent.TLabel", cursor="hand2")
+        link.pack(anchor=tk.W, pady=(2, 0))
+        link.bind("<Button-1>", lambda _e: webbrowser.open(SITE_URL))
+
+        self.btn_save = ttk.Button(top, text="Salvar", style="Accent.TButton", command=self.save_settings)
         self.btn_save.pack(side=tk.RIGHT)
         self.btn_read = ttk.Button(top, text="Ler da placa", command=self.read_from_stick)
         self.btn_read.pack(side=tk.RIGHT, padx=(0, 8))
 
-        ttk.Label(self, textvariable=self.status, padding=(12, 0)).pack(fill=tk.X)
+        ttk.Label(self, textvariable=self.status, style="Muted.TLabel", padding=(14, 0)).pack(fill=tk.X)
 
         container = ttk.Frame(self)
-        container.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-        canvas = tk.Canvas(container, highlightthickness=0)
+        container.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        canvas = tk.Canvas(container, highlightthickness=0, bg=BRAND_BG)
         scroll = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
         self.scroll_body = ttk.Frame(canvas)
         self.scroll_body.bind(
@@ -230,9 +384,10 @@ class StickTunerApp(tk.Tk):
 
         ttk.Label(
             body,
-            text="Centro, zona morta e velocidade. Não toque nos fios/trilha do stick "
-            "(o corpo injeta ruído e o cursor “anda sozinho”).",
-            wraplength=480,
+            text="Calibre centro, zona morta e velocidade. Não toque nos fios do stick "
+            "(ruído do corpo faz o cursor andar sozinho).",
+            style="Muted.TLabel",
+            wraplength=500,
         ).pack(anchor=tk.W, padx=8, pady=(4, 8))
 
         step1 = ttk.LabelFrame(body, text="1) Conectar", padding=8)
@@ -254,14 +409,10 @@ class StickTunerApp(tk.Tk):
         step2.pack(fill=tk.X, **pad)
         live = ttk.Frame(step2)
         live.pack(fill=tk.X)
-        ttk.Label(live, text="X:").pack(side=tk.LEFT)
-        ttk.Label(live, textvariable=self.live_x, font=("Segoe UI", 12, "bold")).pack(
-            side=tk.LEFT, padx=(2, 12)
-        )
-        ttk.Label(live, text="Y:").pack(side=tk.LEFT)
-        ttk.Label(live, textvariable=self.live_y, font=("Segoe UI", 12, "bold")).pack(
-            side=tk.LEFT, padx=(2, 12)
-        )
+        ttk.Label(live, text="X").pack(side=tk.LEFT)
+        ttk.Label(live, textvariable=self.live_x, style="Live.TLabel").pack(side=tk.LEFT, padx=(4, 14))
+        ttk.Label(live, text="Y").pack(side=tk.LEFT)
+        ttk.Label(live, textvariable=self.live_y, style="Live.TLabel").pack(side=tk.LEFT, padx=(4, 14))
         ttk.Button(live, text="Usar como centro", command=self.capture_center).pack(side=tk.LEFT)
 
         step3 = ttk.LabelFrame(body, text="3) Ajustes", padding=8)
@@ -280,7 +431,7 @@ class StickTunerApp(tk.Tk):
             scale.set(var.get())
             scale.grid(row=row_i, column=1, sticky=tk.EW, padx=6)
             ttk.Label(step3, textvariable=var, width=5).grid(row=row_i, column=2, sticky=tk.E)
-            ttk.Label(step3, text=help_text, foreground="#555", font=("Segoe UI", 8)).grid(
+            ttk.Label(step3, text=help_text, style="Muted.TLabel").grid(
                 row=row_i + 1, column=1, sticky=tk.W
             )
             var.trace_add("write", lambda *_a, v=var, s=scale: s.set(v.get()))
@@ -296,21 +447,47 @@ class StickTunerApp(tk.Tk):
             50,
             1000,
         )
-        ttk.Checkbutton(step3, text="Inverter cima/baixo", variable=self.invert_y).grid(
-            row=8, column=0, columnspan=2, sticky=tk.W, pady=4
+        inv = ttk.Frame(step3)
+        inv.grid(row=8, column=0, columnspan=3, sticky=tk.W, pady=6)
+        ttk.Checkbutton(inv, text="Inverter esquerda/direita (X)", variable=self.invert_x).pack(
+            anchor=tk.W
+        )
+        ttk.Checkbutton(inv, text="Inverter cima/baixo (Y)", variable=self.invert_y).pack(
+            anchor=tk.W, pady=(2, 0)
         )
 
         ttk.Label(
             body,
             text="Salvar aplica na placa e guarda no PC. Ao Conectar de novo, reaplica sozinho.",
-            wraplength=480,
-            foreground="#333",
+            style="Muted.TLabel",
+            wraplength=500,
         ).pack(anchor=tk.W, padx=8, pady=(4, 6))
 
         log_frame = ttk.LabelFrame(body, text="Log", padding=6)
         log_frame.pack(fill=tk.BOTH, expand=True, **pad)
-        self.log = tk.Text(log_frame, height=5, wrap=tk.WORD, state=tk.DISABLED)
+        self.log = tk.Text(
+            log_frame,
+            height=5,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            bg=BRAND_PANEL,
+            fg=BRAND_FG,
+            insertbackground=BRAND_FG,
+            relief=tk.FLAT,
+            font=("Consolas", 9),
+        )
         self.log.pack(fill=tk.BOTH, expand=True)
+
+        foot = ttk.Frame(self, padding=(14, 4, 14, 10))
+        foot.pack(fill=tk.X)
+        ttk.Label(
+            foot,
+            text="Feito por Gustavo Moura · GV, MG",
+            style="Muted.TLabel",
+        ).pack(side=tk.LEFT)
+        site = ttk.Label(foot, text=SITE_URL.replace("https://", ""), style="Accent.TLabel", cursor="hand2")
+        site.pack(side=tk.RIGHT)
+        site.bind("<Button-1>", lambda _e: webbrowser.open(SITE_URL))
 
     def log_line(self, text: str):
         def _append():
@@ -342,31 +519,63 @@ class StickTunerApp(tk.Tk):
             self.port_var.set("")
             self.status.set("Nenhuma porta serial — conecte o stick no USB")
             return
-        if select_best or self.port_var.get() not in self._port_map:
-            preferred = next((p for p in ports if p["is_psp"]), None)
-            if not preferred:
-                preferred = next((p for p in ports if p["is_zmk"]), ports[0])
-            self.port_var.set(preferred["label"])
+        # Só preenche a lista — a porta certa vem do Detectar/Conectar (probe)
+        if self.port_var.get() not in self._port_map:
+            self.port_var.set(labels[0] if labels else "")
 
     def toggle_connect(self):
         if self.ser and self.ser.is_open:
             self.disconnect()
         else:
-            self.connect()
+            # Sempre escolhe pela resposta do stick — não pela COM favorita
+            self.connect(auto_pick=True)
 
-    def connect(self, device: str | None = None) -> bool:
-        if device is None:
+    def connect(self, device: str | None = None, auto_pick: bool = False) -> bool:
+        self.refresh_ports(select_best=False)
+
+        if device is None and auto_pick:
+            self.status.set("Procurando porta do stick…")
+            self.update_idletasks()
+            best = find_best_stick_port(wait_s=2.5)
+            if best:
+                device = best["device"]
+                self.log_line(
+                    f"porta escolhida {device} (score={best.get('score')} ain={best.get('ain')})"
+                )
+            else:
+                messagebox.showwarning(
+                    "Não encontrado",
+                    "Nenhuma COM respondeu ao stick.\n"
+                    "Desconecte/reconecte o USB e feche outros apps serial.",
+                )
+                return False
+        elif device is None:
             label = self.port_var.get()
             if not label or label not in self._port_map:
-                messagebox.showwarning("Porta", "Escolha uma porta serial na lista.")
+                messagebox.showwarning("Porta", "Escolha uma porta serial ou use Detectar.")
                 return False
             device = self._port_map[label]
+
         try:
             self.ser = open_serial(device)
         except serial.SerialException as exc:
-            messagebox.showerror("Erro", f"Não foi possível abrir {device}:\n{exc}")
+            msg = str(exc)
+            if "PermissionError" in msg or "Acesso negado" in msg or "Access is denied" in msg:
+                messagebox.showerror(
+                    "Porta ocupada",
+                    f"Não deu para abrir {device}.\n\n"
+                    "Feche outras janelas do tuner / apps serial,\n"
+                    "ou use Detectar (ele testa todas as COMs).",
+                )
+            else:
+                messagebox.showerror("Erro", f"Não foi possível abrir {device}:\n{msg}")
             self.ser = None
             return False
+
+        for label, dev in self._port_map.items():
+            if dev == device:
+                self.port_var.set(label)
+                break
 
         self.reader_stop.clear()
         self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
@@ -374,7 +583,6 @@ class StickTunerApp(tk.Tk):
         self.btn_connect.configure(text="Desconectar")
         self.status.set(f"Conectado em {device}")
         self.log_line(f"== conectado {device} ==")
-        # Reaplica calibração guardada no PC (flash RP2040 não é confiável)
         self.after(400, lambda: self._run_bg(self._job_reconnect_apply))
         self._schedule_live_poll()
         return True
@@ -405,35 +613,44 @@ class StickTunerApp(tk.Tk):
             return
         if self.ser and self.ser.is_open:
             self.disconnect()
-        self.refresh_ports(select_best=True)
-        ports = list_candidate_ports()
-        candidates = [p for p in ports if p["is_zmk"] or p["is_psp"]] or ports
-        self.status.set("Procurando joystick…")
+        self.refresh_ports(select_best=False)
+        self.status.set("Procurando joystick em todas as COMs…")
         self.update_idletasks()
 
         def work():
-            found = None
-            for p in candidates:
-                self.log_line(f"testando {p['device']}…")
-                if probe_stick(p["device"], wait_s=3.5):
-                    found = p["device"]
-                    break
+            ports = list_candidate_ports()
+            for p in ports:
+                if p["is_zmk"] or p["is_psp"]:
+                    self.log_line(f"testando {p['device']}…")
+            best = find_best_stick_port(ports, wait_s=3.0)
+
             def done():
-                if found:
+                if best and best.get("ok"):
+                    found = best["device"]
                     for label, dev in self._port_map.items():
                         if dev == found:
                             self.port_var.set(label)
                             break
-                    self.log_line(f"joystick encontrado em {found}")
+                    self.log_line(
+                        f"joystick em {found} (score={best.get('score')} ain={best.get('ain')})"
+                    )
                     self.connect(found)
-                    messagebox.showinfo("Detectado", f"Joystick encontrado na porta {found}.")
+                    messagebox.showinfo(
+                        "Detectado",
+                        f"Joystick encontrado em {found}.\n"
+                        "A porta muda conforme o USB/PC — o Detectar escolhe pela resposta.",
+                    )
                 else:
                     self.status.set("Não achei o joystick")
                     messagebox.showwarning(
                         "Não encontrado",
-                        "Não recebi resposta do comando stick.\n"
-                        "Flash o firmware novo e feche outros apps na mesma COM.",
+                        "Nenhuma COM respondeu ao stick.\n\n"
+                        "Checklist:\n"
+                        "• Só uma janela do tuner aberta\n"
+                        "• Desconecte e reconecte o USB\n"
+                        "• Feche PuTTY / outros apps serial",
                     )
+
             self.after(0, done)
 
         threading.Thread(target=work, daemon=True).start()
@@ -524,7 +741,7 @@ class StickTunerApp(tk.Tk):
 
         mx, my = grab("mid_x"), grab("mid_y")
         dz, div = grab("deadzone"), grab("divisor")
-        inv = grab("invert_y")
+        inv_x, inv_y = grab("invert_x"), grab("invert_y")
         if mx is not None:
             self.mid_x.set(mx)
         if my is not None:
@@ -533,8 +750,10 @@ class StickTunerApp(tk.Tk):
             self.deadzone.set(dz)
         if div is not None:
             self.divisor.set(div)
-        if inv is not None:
-            self.invert_y.set(bool(inv))
+        if inv_x is not None:
+            self.invert_x.set(bool(inv_x))
+        if inv_y is not None:
+            self.invert_y.set(bool(inv_y))
 
     def _drain_stick_replies(self):
         while True:
@@ -702,6 +921,18 @@ class StickTunerApp(tk.Tk):
 
 
 def main():
+    lock = acquire_single_instance()
+    if lock is None:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showwarning(
+            "Já está aberto",
+            "O PSP Stick Tuner já está rodando.\n"
+            "Feche a outra janela (ou finalize python.exe) e abra de novo.\n\n"
+            "Várias cópias travam a COM no Windows.",
+        )
+        root.destroy()
+        return
     StickTunerApp().mainloop()
 
 
