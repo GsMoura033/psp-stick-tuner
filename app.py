@@ -454,6 +454,8 @@ class StickTunerApp(tk.Tk):
         self._last_reply = ""
         self.log_line(f"> {cmd}")
         try:
+            # Acorda o shell e manda o comando (logs ADC atrasam a resposta)
+            self.ser.write(b"\n")
             self.ser.write((cmd.strip() + "\n").encode("utf-8"))
             self.ser.flush()
         except serial.SerialException as exc:
@@ -461,15 +463,24 @@ class StickTunerApp(tk.Tk):
             return False
         if not wait_ok:
             return True
-        deadline = time.time() + 3.0
+        deadline = time.time() + 6.0
         while time.time() < deadline:
-            if self._last_reply.startswith("STICK OK"):
+            reply = self._last_reply
+            if reply.startswith("STICK OK"):
                 return True
-            if self._last_reply.startswith("STICK ERR"):
+            if reply.startswith("STICK ERR"):
                 return False
             time.sleep(0.05)
             self.update_idletasks()
-        self.log_line("! timeout — placa não respondeu (firmware com shell?)")
+        # Grace: resposta pode chegar logo após o timeout (fila de log cheia)
+        time.sleep(0.4)
+        self.update_idletasks()
+        if self._last_reply.startswith("STICK OK"):
+            self.log_line("(resposta chegou atrasada — OK)")
+            return True
+        if self._last_reply.startswith("STICK ERR"):
+            return False
+        self.log_line("! timeout — placa não respondeu a tempo")
         return False
 
     def read_from_stick(self):
@@ -494,18 +505,24 @@ class StickTunerApp(tk.Tk):
         self.status.set(f"Centro: X={mx} Y={my}")
 
     def save_settings(self):
-        applied = True
-        applied &= self.send_cmd(f"stick mid {self.mid_x.get()} {self.mid_y.get()}")
-        applied &= self.send_cmd(f"stick deadzone {self.deadzone.get()}")
-        applied &= self.send_cmd(f"stick divisor {self.divisor.get()}")
-        applied &= self.send_cmd(f"stick invert_y {1 if self.invert_y.get() else 0}")
-        if not applied:
+        results = {
+            "mid": self.send_cmd(f"stick mid {self.mid_x.get()} {self.mid_y.get()}"),
+            "deadzone": self.send_cmd(f"stick deadzone {self.deadzone.get()}"),
+            "divisor": self.send_cmd(f"stick divisor {self.divisor.get()}"),
+            "invert_y": self.send_cmd(f"stick invert_y {1 if self.invert_y.get() else 0}"),
+        }
+        applied_any = any(results.values())
+        applied_all = all(results.values())
+        if not applied_any:
             messagebox.showwarning(
                 "Falha",
-                "A placa não aceitou os ajustes.\n\n"
-                "Confirme a conexão e o firmware com comandos stick.",
+                "A placa não respondeu a nenhum ajuste.\n\n"
+                "Confirme a conexão COM e o firmware com comandos stick.",
             )
             return
+        if not applied_all:
+            failed = ", ".join(k for k, ok in results.items() if not ok)
+            self.log_line(f"! parcial: falhou ({failed})")
 
         # Persistência na flash (firmware recente com "stick save")
         saved = self.send_cmd("stick save")
@@ -521,10 +538,9 @@ class StickTunerApp(tk.Tk):
         self.status.set("Aplicado agora (ainda não gravado na flash)")
         messagebox.showwarning(
             "Aplicado, mas não gravado",
-            "Os ajustes JÁ ESTÃO valendo agora no mouse.\n\n"
-            "Porém a placa não gravou na flash (comando stick save).\n"
-            "Flash o firmware mais recente do repositório zmk-analog-rp2040 "
-            "e clique em Salvar de novo para manter depois de desligar.",
+            "Os ajustes já devem estar valendo no mouse agora.\n\n"
+            "A gravação na flash (stick save) não confirmou.\n"
+            "Se acabou de flashar o firmware novo, tente Salvar outra vez.",
         )
 
     def on_close(self):
