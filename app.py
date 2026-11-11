@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import queue
 import re
 import threading
 import time
@@ -138,7 +139,7 @@ class StickTunerApp(tk.Tk):
         self.invert_y = tk.BooleanVar(value=False)
 
         self._mv_hist = {0: deque(maxlen=40), 1: deque(maxlen=40)}
-        self._last_reply = ""
+        self._stick_replies: queue.Queue[str] = queue.Queue()
         self._port_map: dict[str, str] = {}
 
         self._build_ui()
@@ -423,7 +424,7 @@ class StickTunerApp(tk.Tk):
 
         sm = STICK_RE.search(line)
         if sm:
-            self._last_reply = line
+            self._stick_replies.put(line)
             self.log_line(line)
             if sm.group(1) == "OK":
                 self._parse_stick_ok(sm.group(2))
@@ -447,15 +448,24 @@ class StickTunerApp(tk.Tk):
         if inv is not None:
             self.invert_y.set(bool(inv))
 
-    def send_cmd(self, cmd: str, wait_ok: bool = True) -> bool:
+    def _drain_stick_replies(self):
+        while True:
+            try:
+                self._stick_replies.get_nowait()
+            except queue.Empty:
+                break
+
+    def send_cmd(self, cmd: str, expect: str | None = None, wait_ok: bool = True) -> bool:
+        """Envia comando shell. expect=substring da resposta OK (ex: 'deadzone=')."""
         if not self.ser or not self.ser.is_open:
             messagebox.showwarning("Serial", "Conecte o joystick primeiro.")
             return False
-        self._last_reply = ""
+        self._drain_stick_replies()
         self.log_line(f"> {cmd}")
         try:
-            # Acorda o shell e manda o comando (logs ADC atrasam a resposta)
+            # Acorda o shell e manda o comando
             self.ser.write(b"\n")
+            time.sleep(0.05)
             self.ser.write((cmd.strip() + "\n").encode("utf-8"))
             self.ser.flush()
         except serial.SerialException as exc:
@@ -463,28 +473,37 @@ class StickTunerApp(tk.Tk):
             return False
         if not wait_ok:
             return True
-        deadline = time.time() + 6.0
-        while time.time() < deadline:
-            reply = self._last_reply
-            if reply.startswith("STICK OK"):
-                return True
-            if reply.startswith("STICK ERR"):
+
+        deadline = time.time() + 8.0
+        late_grace_used = False
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                if not late_grace_used:
+                    late_grace_used = True
+                    deadline = time.time() + 1.0
+                    continue
+                self.log_line("! timeout — placa não respondeu a tempo")
                 return False
-            time.sleep(0.05)
-            self.update_idletasks()
-        # Grace: resposta pode chegar logo após o timeout (fila de log cheia)
-        time.sleep(0.4)
-        self.update_idletasks()
-        if self._last_reply.startswith("STICK OK"):
-            self.log_line("(resposta chegou atrasada — OK)")
-            return True
-        if self._last_reply.startswith("STICK ERR"):
+            try:
+                reply = self._stick_replies.get(timeout=min(0.15, remaining))
+            except queue.Empty:
+                self.update_idletasks()
+                continue
+            # Aceita STICK OK/ERR em qualquer lugar da linha (prompt/ANSI)
+            sm = STICK_RE.search(reply)
+            if not sm:
+                continue
+            if expect and expect not in reply:
+                # Resposta de outro comando — ignora e continua esperando
+                continue
+            if sm.group(1) == "OK":
+                return True
+            self.log_line(f"! placa recusou: {reply}")
             return False
-        self.log_line("! timeout — placa não respondeu a tempo")
-        return False
 
     def read_from_stick(self):
-        if self.send_cmd("stick get"):
+        if self.send_cmd("stick get", expect="mid_x="):
             self.status.set("Valores lidos da placa")
 
     def capture_center(self):
@@ -506,10 +525,18 @@ class StickTunerApp(tk.Tk):
 
     def save_settings(self):
         results = {
-            "mid": self.send_cmd(f"stick mid {self.mid_x.get()} {self.mid_y.get()}"),
-            "deadzone": self.send_cmd(f"stick deadzone {self.deadzone.get()}"),
-            "divisor": self.send_cmd(f"stick divisor {self.divisor.get()}"),
-            "invert_y": self.send_cmd(f"stick invert_y {1 if self.invert_y.get() else 0}"),
+            "mid": self.send_cmd(
+                f"stick mid {self.mid_x.get()} {self.mid_y.get()}", expect="mid_x="
+            ),
+            "deadzone": self.send_cmd(
+                f"stick deadzone {self.deadzone.get()}", expect="deadzone="
+            ),
+            "divisor": self.send_cmd(
+                f"stick divisor {self.divisor.get()}", expect="divisor="
+            ),
+            "invert_y": self.send_cmd(
+                f"stick invert_y {1 if self.invert_y.get() else 0}", expect="invert_y="
+            ),
         }
         applied_any = any(results.values())
         applied_all = all(results.values())
@@ -517,7 +544,8 @@ class StickTunerApp(tk.Tk):
             messagebox.showwarning(
                 "Falha",
                 "A placa não respondeu a nenhum ajuste.\n\n"
-                "Confirme a conexão COM e o firmware com comandos stick.",
+                "Flash o firmware novo (log ADC limitado) e reconecte o USB.\n"
+                "Use a porta COM que mostra X/Y ao vivo.",
             )
             return
         if not applied_all:
@@ -525,7 +553,7 @@ class StickTunerApp(tk.Tk):
             self.log_line(f"! parcial: falhou ({failed})")
 
         # Persistência na flash (firmware recente com "stick save")
-        saved = self.send_cmd("stick save")
+        saved = self.send_cmd("stick save", expect="saved")
         if saved:
             self.status.set("Salvo na placa (flash)")
             messagebox.showinfo(
