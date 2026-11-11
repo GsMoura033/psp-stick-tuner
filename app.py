@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import json
 import queue
 import re
 import threading
 import time
 import tkinter as tk
 from collections import deque
+from pathlib import Path
 from tkinter import messagebox, ttk
 
 try:
@@ -23,6 +25,7 @@ LIVE_RE = re.compile(r"live_x=(-?\d+)\s+live_y=(-?\d+)")
 BAUD = 115200
 ZMK_VID = 0x1D50
 ZMK_PID = 0x615E
+CALIB_PATH = Path.home() / "AppData" / "Local" / "psp-stick-tuner" / "calib.json"
 
 
 def open_serial(device: str, timeout: float = 0.05) -> serial.Serial:
@@ -142,8 +145,54 @@ class StickTunerApp(tk.Tk):
         self._live_job = None
 
         self._build_ui()
+        self._load_local_calib()
         self.refresh_ports(select_best=True)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _load_local_calib(self):
+        try:
+            data = json.loads(CALIB_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return
+        if "mid_x" in data:
+            self.mid_x.set(int(data["mid_x"]))
+        if "mid_y" in data:
+            self.mid_y.set(int(data["mid_y"]))
+        if "deadzone" in data:
+            self.deadzone.set(int(data["deadzone"]))
+        if "divisor" in data:
+            self.divisor.set(int(data["divisor"]))
+        if "invert_y" in data:
+            self.invert_y.set(bool(data["invert_y"]))
+
+    def _save_local_calib(self) -> bool:
+        payload = {
+            "mid_x": self.mid_x.get(),
+            "mid_y": self.mid_y.get(),
+            "deadzone": self.deadzone.get(),
+            "divisor": self.divisor.get(),
+            "invert_y": 1 if self.invert_y.get() else 0,
+        }
+        try:
+            CALIB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            CALIB_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            self.log_line(f"salvo em {CALIB_PATH}")
+            return True
+        except OSError as exc:
+            self.log_line(f"! não gravou no PC: {exc}")
+            return False
+
+    def _apply_current(self) -> bool:
+        mx, my = self.mid_x.get(), self.mid_y.get()
+        dz, div = self.deadzone.get(), self.divisor.get()
+        inv = 1 if self.invert_y.get() else 0
+        results = [
+            self.send_cmd(f"stick mid {mx} {my}", expect="mid_x="),
+            self.send_cmd(f"stick deadzone {dz}", expect="deadzone="),
+            self.send_cmd(f"stick divisor {div}", expect="divisor="),
+            self.send_cmd(f"stick invert_y {inv}", expect="invert_y="),
+        ]
+        return any(results)
 
     def _build_ui(self):
         top = ttk.Frame(self, padding=(12, 10, 12, 6))
@@ -253,7 +302,7 @@ class StickTunerApp(tk.Tk):
 
         ttk.Label(
             body,
-            text="Salvar grava na flash. Valores ficam depois de desligar o USB.",
+            text="Salvar aplica na placa e guarda no PC. Ao Conectar de novo, reaplica sozinho.",
             wraplength=480,
             foreground="#333",
         ).pack(anchor=tk.W, padx=8, pady=(4, 6))
@@ -325,7 +374,8 @@ class StickTunerApp(tk.Tk):
         self.btn_connect.configure(text="Desconectar")
         self.status.set(f"Conectado em {device}")
         self.log_line(f"== conectado {device} ==")
-        self.after(300, lambda: self._run_bg(self._job_read))
+        # Reaplica calibração guardada no PC (flash RP2040 não é confiável)
+        self.after(400, lambda: self._run_bg(self._job_reconnect_apply))
         self._schedule_live_poll()
         return True
 
@@ -555,54 +605,58 @@ class StickTunerApp(tk.Tk):
             lambda: self.status.set("Valores lidos da placa" if ok else "Falha ao ler"),
         )
 
+    def _job_reconnect_apply(self):
+        if not CALIB_PATH.exists():
+            self.send_cmd("stick get", expect="mid_x=")
+            self.after(0, lambda: self.status.set("Conectado"))
+            return
+        ok = self._apply_current()
+        self.after(
+            0,
+            lambda: self.status.set(
+                "Calibração do PC aplicada na placa" if ok else "Conectado (falha ao reaplicar)"
+            ),
+        )
+
     def _job_save(self):
-        mx, my = self.mid_x.get(), self.mid_y.get()
-        dz, div = self.deadzone.get(), self.divisor.get()
-        inv = 1 if self.invert_y.get() else 0
-        results = {
-            "mid": self.send_cmd(f"stick mid {mx} {my}", expect="mid_x="),
-            "deadzone": self.send_cmd(f"stick deadzone {dz}", expect="deadzone="),
-            "divisor": self.send_cmd(f"stick divisor {div}", expect="divisor="),
-            "invert_y": self.send_cmd(f"stick invert_y {inv}", expect="invert_y="),
-        }
-        if not any(results.values()):
+        # Não chama stick save na flash — no RP2040 settings_save_one trava a placa.
+        applied = self._apply_current()
+        if not applied:
             self.after(
                 0,
                 lambda: messagebox.showwarning(
                     "Falha",
-                    "A placa não respondeu.\nFlash o firmware novo e reconecte.",
+                    "A placa não respondeu aos ajustes.\nReconecte o USB e tente de novo.",
                 ),
             )
             return
-        if not all(results.values()):
-            failed = ", ".join(k for k, ok in results.items() if not ok)
-            self.log_line(f"! parcial: {failed}")
-
-        saved = self.send_cmd("stick save", expect="saved", timeout=8.0)
-        if saved:
+        local = self._save_local_calib()
+        # Não envia stick save: no firmware atual o NVS do RP2040 trava a placa.
+        if local:
             self.after(
                 0,
                 lambda: (
-                    self.status.set("Salvo na flash"),
+                    self.status.set("Salvo no PC e aplicado"),
                     messagebox.showinfo(
                         "Salvo",
-                        "Calibração gravada na placa.\nPode desconectar o USB.",
+                        "Ajustes aplicados no mouse e guardados neste PC.\n\n"
+                        "Depois de desligar o USB: abra o tuner e Conectar — "
+                        "ele reaplica sozinho.\n"
+                        f"Arquivo: {CALIB_PATH}",
                     ),
                 ),
             )
-            return
-        self.after(
-            0,
-            lambda: (
-                self.status.set("Aplicado agora (flash não confirmou)"),
-                messagebox.showwarning(
-                    "Aplicado, mas não gravado",
-                    "Os ajustes já valem no mouse agora.\n\n"
-                    "A flash não confirmou — flash o firmware com SETTINGS "
-                    "(Actions mais recente) e tente Salvar de novo.",
+        else:
+            self.after(
+                0,
+                lambda: (
+                    self.status.set("Aplicado (não gravou no PC)"),
+                    messagebox.showwarning(
+                        "Aplicado",
+                        "Os ajustes já valem no mouse, mas não deu para gravar o arquivo no PC.",
+                    ),
                 ),
-            ),
-        )
+            )
 
     def read_from_stick(self):
         if not self.ser or not self.ser.is_open:
