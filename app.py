@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PSP Stick Tuner — calibração amigável do joystick ZMK via USB."""
+"""PSP Stick Tuner — calibração leve do joystick ZMK via USB."""
 
 from __future__ import annotations
 
@@ -17,8 +17,9 @@ try:
 except ImportError:
     raise SystemExit("Instale as dependências: pip install -r requirements.txt")
 
-AIN_RE = re.compile(r"AIN(\d+)\s+raw:\s*(-?\d+)\s+mv:\s*(-?\d+)")
 STICK_RE = re.compile(r"STICK\s+(OK|ERR)\b(.*)$")
+AIN_RE = re.compile(r"AIN(\d+)\s+raw:\s*(-?\d+)\s+mv:\s*(-?\d+)")
+LIVE_RE = re.compile(r"live_x=(-?\d+)\s+live_y=(-?\d+)")
 BAUD = 115200
 ZMK_VID = 0x1D50
 ZMK_PID = 0x615E
@@ -33,7 +34,6 @@ def open_serial(device: str, timeout: float = 0.05) -> serial.Serial:
     ser.write_timeout = 2
     ser.dsrdtr = False
     ser.rtscts = False
-    # Definir antes do open para não resetar a placa
     ser.dtr = False
     ser.rts = False
     ser.open()
@@ -42,7 +42,7 @@ def open_serial(device: str, timeout: float = 0.05) -> serial.Serial:
         ser.rts = False
     except Exception:
         pass
-    time.sleep(0.15)
+    time.sleep(0.1)
     ser.reset_input_buffer()
     return ser
 
@@ -79,7 +79,6 @@ def list_candidate_ports():
 
 
 def probe_stick(device: str, wait_s: float = 3.0) -> bool:
-    """Envia stick get e espera STICK OK (com retentativas)."""
     try:
         ser = open_serial(device, timeout=0.2)
     except serial.SerialException:
@@ -96,14 +95,11 @@ def probe_stick(device: str, wait_s: float = 3.0) -> bool:
                     ser.flush()
                 except serial.SerialException:
                     return False
-                next_send = now + 0.6
+                next_send = now + 0.7
             chunk = ser.read(512)
             if chunk:
                 buf += chunk.decode("utf-8", errors="ignore")
                 if "STICK OK" in buf:
-                    return True
-                if "STICK ERR" in buf and "no device" not in buf.lower():
-                    # firmware respondeu ao protocolo
                     return True
             time.sleep(0.05)
         return False
@@ -118,14 +114,14 @@ class StickTunerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PSP Stick Tuner")
-        # Cabe na maioria das telas; o conteúdo rola por dentro
-        self.geometry("560x640")
-        self.minsize(480, 480)
+        self.geometry("520x580")
+        self.minsize(460, 440)
 
         self.ser: serial.Serial | None = None
         self.reader_stop = threading.Event()
         self.reader_thread: threading.Thread | None = None
         self.lock = threading.Lock()
+        self.busy = False
 
         self.live_x = tk.StringVar(value="—")
         self.live_y = tk.StringVar(value="—")
@@ -134,44 +130,39 @@ class StickTunerApp(tk.Tk):
 
         self.mid_x = tk.IntVar(value=8880)
         self.mid_y = tk.IntVar(value=9400)
-        self.deadzone = tk.IntVar(value=200)
+        self.deadzone = tk.IntVar(value=350)
         self.divisor = tk.IntVar(value=500)
         self.invert_y = tk.BooleanVar(value=False)
 
-        self._mv_hist = {0: deque(maxlen=40), 1: deque(maxlen=40)}
+        self._mv_hist = {0: deque(maxlen=20), 1: deque(maxlen=20)}
         self._stick_replies: queue.Queue[str] = queue.Queue()
         self._port_map: dict[str, str] = {}
+        self._ui_x = None
+        self._ui_y = None
+        self._live_job = None
 
         self._build_ui()
         self.refresh_ports(select_best=True)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_ui(self):
-        # Barra fixa no topo com Salvar sempre visível
         top = ttk.Frame(self, padding=(12, 10, 12, 6))
         top.pack(fill=tk.X)
         ttk.Label(top, text="PSP Stick Tuner", font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT)
-        ttk.Button(top, text="Salvar na placa", command=self.save_settings).pack(side=tk.RIGHT)
-        ttk.Button(top, text="Ler da placa", command=self.read_from_stick).pack(side=tk.RIGHT, padx=(0, 8))
+        self.btn_save = ttk.Button(top, text="Salvar na placa", command=self.save_settings)
+        self.btn_save.pack(side=tk.RIGHT)
+        self.btn_read = ttk.Button(top, text="Ler da placa", command=self.read_from_stick)
+        self.btn_read.pack(side=tk.RIGHT, padx=(0, 8))
 
-        ttk.Label(
-            self,
-            textvariable=self.status,
-            padding=(12, 0),
-            foreground="#333",
-        ).pack(fill=tk.X)
+        ttk.Label(self, textvariable=self.status, padding=(12, 0)).pack(fill=tk.X)
 
-        # Área com scroll
         container = ttk.Frame(self)
         container.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-
         canvas = tk.Canvas(container, highlightthickness=0)
         scroll = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
         self.scroll_body = ttk.Frame(canvas)
-
         self.scroll_body.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
         self._canvas_window = canvas.create_window((0, 0), window=self.scroll_body, anchor=tk.NW)
 
@@ -182,11 +173,7 @@ class StickTunerApp(tk.Tk):
         canvas.configure(yscrollcommand=scroll.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        def _wheel(event):
-            canvas.yview_scroll(int(-event.delta / 120), "units")
-
-        canvas.bind_all("<MouseWheel>", _wheel)
+        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
         self._canvas = canvas
 
         body = self.scroll_body
@@ -194,21 +181,15 @@ class StickTunerApp(tk.Tk):
 
         ttk.Label(
             body,
-            text="Calibre o joystick USB. Inclinação = velocidade. "
-            "Aqui você define centro, zona morta e velocidade máxima.",
-            wraplength=500,
+            text="Centro, zona morta e velocidade. Não toque nos fios/trilha do stick "
+            "(o corpo injeta ruído e o cursor “anda sozinho”).",
+            wraplength=480,
         ).pack(anchor=tk.W, padx=8, pady=(4, 8))
 
-        # Passo 1
         step1 = ttk.LabelFrame(body, text="1) Conectar", padding=8)
         step1.pack(fill=tk.X, **pad)
-        ttk.Label(
-            step1,
-            text="Joystick na placa com VCC em 3,3 V → USB no PC → Detectar (ou Conectar).",
-            wraplength=500,
-        ).pack(anchor=tk.W)
         row = ttk.Frame(step1)
-        row.pack(fill=tk.X, pady=(6, 0))
+        row.pack(fill=tk.X)
         self.port_combo = ttk.Combobox(row, textvariable=self.port_var, state="readonly")
         self.port_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(row, text="Atualizar", command=lambda: self.refresh_ports(True)).pack(
@@ -220,7 +201,6 @@ class StickTunerApp(tk.Tk):
         self.btn_connect = ttk.Button(btns, text="Conectar", command=self.toggle_connect)
         self.btn_connect.pack(side=tk.LEFT, padx=8)
 
-        # Passo 2
         step2 = ttk.LabelFrame(body, text="2) Centro (stick parado)", padding=8)
         step2.pack(fill=tk.X, **pad)
         live = ttk.Frame(step2)
@@ -235,7 +215,6 @@ class StickTunerApp(tk.Tk):
         )
         ttk.Button(live, text="Usar como centro", command=self.capture_center).pack(side=tk.LEFT)
 
-        # Passo 3
         step3 = ttk.LabelFrame(body, text="3) Ajustes", padding=8)
         step3.pack(fill=tk.X, **pad)
         step3.columnconfigure(1, weight=1)
@@ -259,11 +238,11 @@ class StickTunerApp(tk.Tk):
 
         add_scale(0, "Centro X", "Se driftar para os lados", self.mid_x, 0, 12000)
         add_scale(2, "Centro Y", "Se driftar para cima/baixo", self.mid_y, 0, 12000)
-        add_scale(4, "Zona morta", "Maior = menos tremor parado", self.deadzone, 0, 255)
+        add_scale(4, "Zona morta", "Maior = menos tremor / menos ruído ao tocar", self.deadzone, 0, 600)
         add_scale(
             6,
             "Velocidade",
-            "MAIOR = mais lento (vale no máximo de inclinação)",
+            "MAIOR = mais lento (no máximo de inclinação)",
             self.divisor,
             50,
             1000,
@@ -274,25 +253,36 @@ class StickTunerApp(tk.Tk):
 
         ttk.Label(
             body,
-            text="Use o botão “Salvar na placa” no topo para gravar. "
-            "Os valores ficam guardados depois de desligar o USB.",
-            wraplength=500,
+            text="Salvar grava na flash. Valores ficam depois de desligar o USB.",
+            wraplength=480,
             foreground="#333",
         ).pack(anchor=tk.W, padx=8, pady=(4, 6))
 
         log_frame = ttk.LabelFrame(body, text="Log", padding=6)
         log_frame.pack(fill=tk.BOTH, expand=True, **pad)
-        self.log = tk.Text(log_frame, height=6, wrap=tk.WORD, state=tk.DISABLED)
+        self.log = tk.Text(log_frame, height=5, wrap=tk.WORD, state=tk.DISABLED)
         self.log.pack(fill=tk.BOTH, expand=True)
 
     def log_line(self, text: str):
         def _append():
             self.log.configure(state=tk.NORMAL)
             self.log.insert(tk.END, text + "\n")
+            # Mantém log curto
+            lines = int(self.log.index("end-1c").split(".")[0])
+            if lines > 80:
+                self.log.delete("1.0", f"{lines - 60}.0")
             self.log.see(tk.END)
             self.log.configure(state=tk.DISABLED)
 
         self.after(0, _append)
+
+    def _set_busy(self, busy: bool, status: str | None = None):
+        self.busy = busy
+        state = tk.DISABLED if busy else tk.NORMAL
+        self.btn_save.configure(state=state)
+        self.btn_read.configure(state=state)
+        if status:
+            self.status.set(status)
 
     def refresh_ports(self, select_best: bool = False):
         ports = list_candidate_ports()
@@ -335,10 +325,17 @@ class StickTunerApp(tk.Tk):
         self.btn_connect.configure(text="Desconectar")
         self.status.set(f"Conectado em {device}")
         self.log_line(f"== conectado {device} ==")
-        self.after(500, self.read_from_stick)
+        self.after(300, lambda: self._run_bg(self._job_read))
+        self._schedule_live_poll()
         return True
 
     def disconnect(self):
+        if self._live_job is not None:
+            try:
+                self.after_cancel(self._live_job)
+            except Exception:
+                pass
+            self._live_job = None
         self.reader_stop.set()
         if self.reader_thread and self.reader_thread.is_alive():
             self.reader_thread.join(timeout=1.0)
@@ -354,38 +351,42 @@ class StickTunerApp(tk.Tk):
         self.log_line("== desconectado ==")
 
     def detect_stick(self):
+        if self.busy:
+            return
         if self.ser and self.ser.is_open:
             self.disconnect()
         self.refresh_ports(select_best=True)
         ports = list_candidate_ports()
         candidates = [p for p in ports if p["is_zmk"] or p["is_psp"]] or ports
-        self.status.set("Procurando joystick… aguarde alguns segundos")
+        self.status.set("Procurando joystick…")
         self.update_idletasks()
-        self.log_line("detectar: iniciando (sem reset DTR)")
 
-        for p in candidates:
-            self.log_line(f"testando {p['device']}…")
-            self.update_idletasks()
-            if probe_stick(p["device"], wait_s=4.0):
-                for label, dev in self._port_map.items():
-                    if dev == p["device"]:
-                        self.port_var.set(label)
-                        break
-                self.log_line(f"joystick encontrado em {p['device']}")
-                self.connect(p["device"])
-                messagebox.showinfo("Detectado", f"Joystick encontrado na porta {p['device']}.")
-                return
+        def work():
+            found = None
+            for p in candidates:
+                self.log_line(f"testando {p['device']}…")
+                if probe_stick(p["device"], wait_s=3.5):
+                    found = p["device"]
+                    break
+            def done():
+                if found:
+                    for label, dev in self._port_map.items():
+                        if dev == found:
+                            self.port_var.set(label)
+                            break
+                    self.log_line(f"joystick encontrado em {found}")
+                    self.connect(found)
+                    messagebox.showinfo("Detectado", f"Joystick encontrado na porta {found}.")
+                else:
+                    self.status.set("Não achei o joystick")
+                    messagebox.showwarning(
+                        "Não encontrado",
+                        "Não recebi resposta do comando stick.\n"
+                        "Flash o firmware novo e feche outros apps na mesma COM.",
+                    )
+            self.after(0, done)
 
-        self.status.set("Não achei o joystick")
-        messagebox.showwarning(
-            "Não encontrado",
-            "Não recebi resposta do comando stick.\n\n"
-            "Checklist:\n"
-            "• Flashou o firmware mais recente (com tuner/shell)?\n"
-            "• A placa está no USB e aparece como dispositivo serial?\n"
-            "• Feche PuTTY ou outro app usando a mesma COM\n"
-            "• Se a lista mostra a porta certa, tente Conectar manualmente",
-        )
+        threading.Thread(target=work, daemon=True).start()
 
     def _reader_loop(self):
         buf = ""
@@ -410,24 +411,48 @@ class StickTunerApp(tk.Tk):
     def _handle_line(self, line: str):
         if not line:
             return
+        # Firmware antigo ainda pode spit AIN; aceita sem floodar a UI
         m = AIN_RE.search(line)
         if m:
             idx = int(m.group(1))
             mv = int(m.group(3))
             with self.lock:
-                self._mv_hist.setdefault(idx, deque(maxlen=40)).append(mv)
+                self._mv_hist.setdefault(idx, deque(maxlen=20)).append(mv)
             if idx == 0:
-                self.after(0, lambda: self.live_x.set(str(mv)))
+                self._ui_x = mv
             elif idx == 1:
-                self.after(0, lambda: self.live_y.set(str(mv)))
+                self._ui_y = mv
             return
 
         sm = STICK_RE.search(line)
         if sm:
             self._stick_replies.put(line)
-            self.log_line(line)
-            if sm.group(1) == "OK":
-                self._parse_stick_ok(sm.group(2))
+            rest = sm.group(2)
+            lm = LIVE_RE.search(rest)
+            if lm:
+                x, y = int(lm.group(1)), int(lm.group(2))
+                with self.lock:
+                    self._mv_hist[0].append(x)
+                    self._mv_hist[1].append(y)
+                self._ui_x, self._ui_y = x, y
+            elif sm.group(1) == "OK" and "live_x=" not in rest:
+                self.log_line(line)
+                self.after(0, lambda r=rest: self._parse_stick_ok(r))
+
+    def _flush_live_ui(self):
+        if self._ui_x is not None:
+            self.live_x.set(str(self._ui_x))
+        if self._ui_y is not None:
+            self.live_y.set(str(self._ui_y))
+
+    def _schedule_live_poll(self):
+        self._flush_live_ui()
+        if not self.ser or not self.ser.is_open:
+            return
+        # Poll leve ~4 Hz; não bloqueia a UI
+        if not self.busy:
+            self._write_raw("stick live\n")
+        self._live_job = self.after(250, self._schedule_live_poll)
 
     def _parse_stick_ok(self, rest: str):
         def grab(name):
@@ -455,67 +480,138 @@ class StickTunerApp(tk.Tk):
             except queue.Empty:
                 break
 
-    def send_cmd(self, cmd: str, expect: str | None = None, wait_ok: bool = True) -> bool:
-        """Envia comando shell. expect=substring da resposta OK (ex: 'deadzone=')."""
+    def _write_raw(self, data: str):
         if not self.ser or not self.ser.is_open:
-            messagebox.showwarning("Serial", "Conecte o joystick primeiro.")
+            return
+        try:
+            self.ser.write(data.encode("utf-8"))
+            self.ser.flush()
+        except serial.SerialException:
+            pass
+
+    def send_cmd(self, cmd: str, expect: str | None = None, timeout: float = 5.0) -> bool:
+        """Chamar só de thread de background (nunca da UI)."""
+        if not self.ser or not self.ser.is_open:
             return False
         self._drain_stick_replies()
         self.log_line(f"> {cmd}")
         try:
-            # Acorda o shell e manda o comando
             self.ser.write(b"\n")
-            time.sleep(0.05)
+            time.sleep(0.03)
             self.ser.write((cmd.strip() + "\n").encode("utf-8"))
             self.ser.flush()
         except serial.SerialException as exc:
-            messagebox.showerror("Serial", str(exc))
+            self.log_line(f"! serial: {exc}")
             return False
-        if not wait_ok:
-            return True
 
-        deadline = time.time() + 8.0
-        late_grace_used = False
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                if not late_grace_used:
-                    late_grace_used = True
-                    deadline = time.time() + 1.0
-                    continue
-                self.log_line("! timeout — placa não respondeu a tempo")
-                return False
+        deadline = time.time() + timeout
+        while time.time() < deadline:
             try:
-                reply = self._stick_replies.get(timeout=min(0.15, remaining))
+                reply = self._stick_replies.get(timeout=0.1)
             except queue.Empty:
-                self.update_idletasks()
                 continue
-            # Aceita STICK OK/ERR em qualquer lugar da linha (prompt/ANSI)
             sm = STICK_RE.search(reply)
             if not sm:
                 continue
             if expect and expect not in reply:
-                # Resposta de outro comando — ignora e continua esperando
                 continue
             if sm.group(1) == "OK":
                 return True
-            self.log_line(f"! placa recusou: {reply}")
+            self.log_line(f"! placa: {reply}")
             return False
+        self.log_line("! timeout")
+        return False
+
+    def _run_bg(self, fn):
+        if self.busy:
+            return
+        self._set_busy(True, "Trabalhando…")
+
+        def work():
+            try:
+                fn()
+            finally:
+                self.after(0, lambda: self._set_busy(False))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _job_read(self):
+        ok = self.send_cmd("stick get", expect="mid_x=")
+        self.after(
+            0,
+            lambda: self.status.set("Valores lidos da placa" if ok else "Falha ao ler"),
+        )
+
+    def _job_save(self):
+        mx, my = self.mid_x.get(), self.mid_y.get()
+        dz, div = self.deadzone.get(), self.divisor.get()
+        inv = 1 if self.invert_y.get() else 0
+        results = {
+            "mid": self.send_cmd(f"stick mid {mx} {my}", expect="mid_x="),
+            "deadzone": self.send_cmd(f"stick deadzone {dz}", expect="deadzone="),
+            "divisor": self.send_cmd(f"stick divisor {div}", expect="divisor="),
+            "invert_y": self.send_cmd(f"stick invert_y {inv}", expect="invert_y="),
+        }
+        if not any(results.values()):
+            self.after(
+                0,
+                lambda: messagebox.showwarning(
+                    "Falha",
+                    "A placa não respondeu.\nFlash o firmware novo e reconecte.",
+                ),
+            )
+            return
+        if not all(results.values()):
+            failed = ", ".join(k for k, ok in results.items() if not ok)
+            self.log_line(f"! parcial: {failed}")
+
+        saved = self.send_cmd("stick save", expect="saved", timeout=8.0)
+        if saved:
+            self.after(
+                0,
+                lambda: (
+                    self.status.set("Salvo na flash"),
+                    messagebox.showinfo(
+                        "Salvo",
+                        "Calibração gravada na placa.\nPode desconectar o USB.",
+                    ),
+                ),
+            )
+            return
+        self.after(
+            0,
+            lambda: (
+                self.status.set("Aplicado agora (flash não confirmou)"),
+                messagebox.showwarning(
+                    "Aplicado, mas não gravado",
+                    "Os ajustes já valem no mouse agora.\n\n"
+                    "A flash não confirmou — flash o firmware com SETTINGS "
+                    "(Actions mais recente) e tente Salvar de novo.",
+                ),
+            ),
+        )
 
     def read_from_stick(self):
-        if self.send_cmd("stick get", expect="mid_x="):
-            self.status.set("Valores lidos da placa")
+        if not self.ser or not self.ser.is_open:
+            messagebox.showwarning("Serial", "Conecte o joystick primeiro.")
+            return
+        self._run_bg(self._job_read)
 
     def capture_center(self):
         with self.lock:
             xs = list(self._mv_hist.get(0, []))
             ys = list(self._mv_hist.get(1, []))
-        if len(xs) < 5 or len(ys) < 5:
-            messagebox.showinfo(
-                "Centro",
-                "Conecte, espere 1–2 s com o stick parado, e tente de novo.",
-            )
-            return
+        if not xs or not ys:
+            # Usa último valor da UI se o hist ainda está vazio
+            try:
+                xs = [int(self.live_x.get())]
+                ys = [int(self.live_y.get())]
+            except ValueError:
+                messagebox.showinfo(
+                    "Centro",
+                    "Conecte, espere o X/Y aparecer, deixe o stick parado e tente de novo.",
+                )
+                return
         mx = int(sum(xs) / len(xs))
         my = int(sum(ys) / len(ys))
         self.mid_x.set(mx)
@@ -524,52 +620,10 @@ class StickTunerApp(tk.Tk):
         self.status.set(f"Centro: X={mx} Y={my}")
 
     def save_settings(self):
-        results = {
-            "mid": self.send_cmd(
-                f"stick mid {self.mid_x.get()} {self.mid_y.get()}", expect="mid_x="
-            ),
-            "deadzone": self.send_cmd(
-                f"stick deadzone {self.deadzone.get()}", expect="deadzone="
-            ),
-            "divisor": self.send_cmd(
-                f"stick divisor {self.divisor.get()}", expect="divisor="
-            ),
-            "invert_y": self.send_cmd(
-                f"stick invert_y {1 if self.invert_y.get() else 0}", expect="invert_y="
-            ),
-        }
-        applied_any = any(results.values())
-        applied_all = all(results.values())
-        if not applied_any:
-            messagebox.showwarning(
-                "Falha",
-                "A placa não respondeu a nenhum ajuste.\n\n"
-                "Flash o firmware novo (log ADC limitado) e reconecte o USB.\n"
-                "Use a porta COM que mostra X/Y ao vivo.",
-            )
+        if not self.ser or not self.ser.is_open:
+            messagebox.showwarning("Serial", "Conecte o joystick primeiro.")
             return
-        if not applied_all:
-            failed = ", ".join(k for k, ok in results.items() if not ok)
-            self.log_line(f"! parcial: falhou ({failed})")
-
-        # Persistência na flash (firmware recente com "stick save")
-        saved = self.send_cmd("stick save", expect="saved")
-        if saved:
-            self.status.set("Salvo na placa (flash)")
-            messagebox.showinfo(
-                "Salvo",
-                "Calibração gravada na memória da placa.\n"
-                "Pode desconectar o USB — os valores permanecem.",
-            )
-            return
-
-        self.status.set("Aplicado agora (ainda não gravado na flash)")
-        messagebox.showwarning(
-            "Aplicado, mas não gravado",
-            "Os ajustes já devem estar valendo no mouse agora.\n\n"
-            "A gravação na flash (stick save) não confirmou.\n"
-            "Se acabou de flashar o firmware novo, tente Salvar outra vez.",
-        )
+        self._run_bg(self._job_save)
 
     def on_close(self):
         try:
