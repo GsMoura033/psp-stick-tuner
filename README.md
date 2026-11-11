@@ -26,8 +26,12 @@ Também dá para pegar o artefato do Actions (**PSP-Stick-Tuner-windows**) em qu
 5. Stick parado → **Usar como centro**
 6. Ajuste zona morta / velocidade / inverter eixos → **Salvar**
 
-> **Salvar** aplica na placa **e** guarda a calibração neste PC.  
-> No próximo **Conectar**, o app reaplica sozinho (a flash NVS do RP2040 pode travar — por isso a persistência é no host).
+> **Salvar** grava a calibração **na flash da placa**. Depois disso o stick funciona em qualquer PC (incluindo Windows XP como mouse USB), sem depender deste computador.
+
+### Windows XP
+
+- **Usar o stick no XP:** sim — depois de calibrar e salvar na placa (em um PC com Win10/11), é só um mouse USB.
+- **Rodar o `.exe` do tuner no XP:** não. O executável atual é para **Windows 10/11**. Calibre no PC moderno, use no XP.
 
 ### Controles
 
@@ -38,7 +42,7 @@ Também dá para pegar o artefato do Actions (**PSP-Stick-Tuner-windows**) em qu
 | **Zona morta** | Maior = menos tremor parado |
 | **Velocidade** | **Maior = mais lento** no máximo de inclinação |
 | **Inverter X / Y** | Espelha esquerda-direita ou cima-baixo |
-| **Salvar** | Aplica na placa + JSON local |
+| **Salvar** | Aplica e grava na memória da placa |
 
 ## Rodar do código
 
