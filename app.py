@@ -248,7 +248,7 @@ class StickTunerApp(tk.Tk):
         self.mid_x = tk.IntVar(value=8880)
         self.mid_y = tk.IntVar(value=9400)
         self.deadzone = tk.IntVar(value=350)
-        self.divisor = tk.IntVar(value=500)
+        self.divisor = tk.IntVar(value=1200)
         self.invert_x = tk.BooleanVar(value=False)
         self.invert_y = tk.BooleanVar(value=False)
 
@@ -431,10 +431,10 @@ class StickTunerApp(tk.Tk):
         add_scale(
             6,
             "Velocidade",
-            "MAIOR = mais lento (no máximo de inclinação)",
+            "MAIOR = mais lento (tente 1200–2500; máximo 3000)",
             self.divisor,
             50,
-            1000,
+            3000,
         )
         inv = ttk.Frame(step3)
         inv.grid(row=8, column=0, columnspan=3, sticky=tk.W, pady=6)
